@@ -3,6 +3,10 @@ Miscellanous functions etc.
 """
 
 import hashlib
+import requests
+import re
+from copy import copy
+import platform
 import inspect
 import json
 import os
@@ -10,39 +14,37 @@ import socket
 import sys
 import uuid
 import warnings
+from dataclasses import dataclass, field
 from datetime import timedelta
 from difflib import get_close_matches
 from functools import cache as memoize
 from functools import partial, wraps
 from pathlib import Path
-from typing import Callable, List, Literal, Union, get_type_hints
 
 import bs4
 import litellm
 from beartype.door import is_bearable
+from beartype.typing import (
+    Dict,
+    Callable,
+    List,
+    Literal,
+    Union,
+    get_type_hints,
+    Optional,
+    Any,
+)
 from joblib import Memory
 from joblib import hash as jhash
 from langchain.docstore.document import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter, TextSplitter
 from langchain_core.runnables import chain
-from py_ankiconnect import PyAnkiconnect
+from platformdirs import user_cache_dir
+from loguru import logger
 
-from .env import (
-    WDOC_EXPIRE_CACHE_DAYS,
-    WDOC_IMPORT_TYPE,
-    WDOC_MAX_CHUNK_SIZE,
-    WDOC_NO_MODELNAME_MATCHING,
-    WDOC_STRICT_DOCDICT,
-)
+from .env import env, is_input_piped
 from .errors import UnexpectedDocDictArgument
-from .flags import is_debug, is_private, is_verbose
-from .logger import cache_dir, red, whi, yel
 from .typechecker import optional_typecheck
-
-ankiconnect = optional_typecheck(PyAnkiconnect())
-
-# will be replaced when load_one_doc is called, by the path to the file where the loaders can store temporary file
-loaders_temp_dir_file = cache_dir / "loaders_temp_dir.txt"
 
 # ignore warnings from beautiful soup that can happen because anki is not exactly html
 warnings.filterwarnings(
@@ -66,9 +68,9 @@ try:
 
     assert isinstance(language_detector("This is a test"), float)
 except Exception as err:
-    if is_verbose:
-        red(
-            f"Couldn't import optional package 'ftlangdetect', trying to import langdetect (but it's much slower): '{err}'"
+    if env.WDOC_VERBOSE:
+        logger.warning(
+            f"Couldn't import optional package 'ftlangdetect' from 'fasttext-langdetect', trying to import langdetect (but it's much slower): '{err}'"
         )
     if "ftlangdetect" in sys.modules:
         del sys.modules["ftlangdetect"]
@@ -82,13 +84,33 @@ except Exception as err:
 
         assert isinstance(language_detector("This is a test"), float)
     except Exception as err:
-        if is_verbose:
-            red(f"Couldn't import optional package 'langdetect' either: '{err}'")
+        if env.WDOC_VERBOSE:
+            logger.warning(
+                f"Couldn't import optional package 'langdetect' either: '{err}'"
+            )
 
         @optional_typecheck
         def language_detector(text: str) -> None:
             return None
 
+
+if (
+    "OVERRIDE_USER_DIR_PYTEST_WDOC" in os.environ
+    and os.environ["OVERRIDE_USER_DIR_PYTEST_WDOC"] == "true"
+):
+    cache_dir = Path.cwd() / "wdoc_user_cache_dir"
+    if cache_dir.exists():
+        logger.debug(
+            f"PYTEST detected so using cache_dir '{cache_dir.absolute()}' (already exists)"
+        )
+    else:
+        logger.debug(
+            f"PYTEST detected so using cache_dir '{cache_dir.absolute()}' (does not exists)"
+        )
+else:
+    cache_dir = Path(user_cache_dir(appname="wdoc"))
+
+cache_dir.mkdir(parents=True, exist_ok=True)
 
 doc_loaders_cache_dir = cache_dir / "doc_loaders"
 doc_loaders_cache_dir.mkdir(exist_ok=True)
@@ -100,10 +122,14 @@ hashdoc_cache = Memory(hashdoc_cache_dir, verbose=0)
 query_eval_cache = Memory(cache_dir / "query_eval_llm", verbose=0)
 
 # remove cache files older than X days
-if WDOC_EXPIRE_CACHE_DAYS:
-    doc_loaders_cache.reduce_size(age_limit=timedelta(days=WDOC_EXPIRE_CACHE_DAYS))
-    hashdoc_cache.reduce_size(age_limit=timedelta(days=WDOC_EXPIRE_CACHE_DAYS))
-    query_eval_cache.reduce_size(age_limit=timedelta(days=WDOC_EXPIRE_CACHE_DAYS))
+if env.WDOC_EXPIRE_CACHE_DAYS:
+    doc_loaders_cache.reduce_size(
+        age_limit=timedelta(days=int(env.WDOC_EXPIRE_CACHE_DAYS))
+    )
+    hashdoc_cache.reduce_size(age_limit=timedelta(days=int(env.WDOC_EXPIRE_CACHE_DAYS)))
+    query_eval_cache.reduce_size(
+        age_limit=timedelta(days=int(env.WDOC_EXPIRE_CACHE_DAYS))
+    )
 
 # for reading length estimation
 wpm = 250
@@ -115,6 +141,9 @@ recur_separator = ["\n\n\n\n", "\n\n\n", "\n\n", "\n", "...", ".", " ", ""]
 min_token = 20
 max_token = 10_000_000
 min_lang_prob = 0.50
+
+# list of available tasks
+tasks_list = ["query", "summarize", "parse", "search", "summarize_then_query"]
 
 printed_unexpected_api_keys = [False]  # to print it only once
 
@@ -150,7 +179,6 @@ filetype_arg_types = {
 extra_args_types = {
     "path": Union[str, Path],
     "embed_instruct": str,
-    "out_file": Union[str, Path],
     "include": str,
     "exclude": str,
     "filter_content": Union[List[str], str],
@@ -187,7 +215,7 @@ class DocDict(dict):
         )
     )
     allowed_types: dict = filetype_arg_types
-    __strict__ = WDOC_STRICT_DOCDICT
+    __strict__ = env.WDOC_STRICT_DOCDICT
 
     def __hash__(self):
         "make it hashable, to check for duplicates"
@@ -213,10 +241,10 @@ class DocDict(dict):
             if strict is True:
                 raise UnexpectedDocDictArgument(mess)
             elif strict is False:
-                red(mess)
+                logger.warning(mess)
                 return True
             elif strict == "strip":
-                red(mess)
+                logger.warning(mess)
                 return False
             else:
                 raise ValueError(strict)
@@ -236,16 +264,16 @@ class DocDict(dict):
             if strict is True:
                 raise UnexpectedDocDictArgument(mess)
             elif strict is False:
-                red(mess)
+                logger.warning(mess)
                 return True
             elif strict == "strip":
-                red(mess)
+                logger.warning(mess)
                 return False
             else:
                 raise ValueError(strict)
         return True
 
-    def __init__(self, docdict: dict, strict=WDOC_STRICT_DOCDICT) -> None:
+    def __init__(self, docdict: dict, strict=env.WDOC_STRICT_DOCDICT) -> None:
         assert docdict, "Can't give an empty docdict as argument"
         assert strict in [True, False, "strip"], "Unexpected strict value"
         ignore_kwargs = []
@@ -274,7 +302,7 @@ def optional_strip_unexp_args(func: Callable) -> Callable:
     """if the environment variable WDOC_STRICT_DOCDICT is set to 'true'
     then this automatically removes any unexpected argument before calling a
     loader function for a specific filetype."""
-    if not WDOC_STRICT_DOCDICT:
+    if not env.WDOC_STRICT_DOCDICT:
         return optional_typecheck(func)
     else:
         # find the true function, otherwise func can be a decorated truefunc and might forget the annotations.
@@ -307,7 +335,7 @@ def optional_strip_unexp_args(func: Callable) -> Callable:
                 mess = f"Unexpected args or kwargs in func {func}:"
                 for kwarg in diffkwargs:
                     mess += f"\n-KWARG: {kwarg}"
-                red(mess)
+                logger.warning(mess)
             assert (
                 kwargs2
             ), f"No kwargs2 found for func {func}. There's probably an issue with the decorator"
@@ -382,16 +410,18 @@ def html_to_text(html: str, remove_image: bool = False) -> str:
             elif element[:-2] + ">" in html:
                 content.append(element[:-2] + ">")
             else:
-                if is_verbose:
+                if env.WDOC_VERBOSE:
                     temptext = " ".join(filter(None, content))
-                    red(f"Image not properly parsed from bs4:\n{element}\n{temptext}")
+                    logger.warning(
+                        f"Image not properly parsed from bs4:\n{element}\n{temptext}"
+                    )
         elif isinstance(element, bs4.NavigableString):
             content.append(str(element).strip())
     text = " ".join(filter(None, content))
     while "\n\n" in text:
         text = text.replace("\n\n", "\n")
     if "<img" in text and remove_image:
-        red(f"Failed to remove <img from anki card: {text}")
+        logger.warning(f"Failed to remove <img from anki card: {text}")
     return text
 
 
@@ -400,7 +430,7 @@ def html_to_text(html: str, remove_image: bool = False) -> str:
 def debug_chain(inputs: Union[dict, List]) -> Union[dict, List]:
     "use it between | pipes | in a chain to open the debugger"
     if hasattr(inputs, "keys"):
-        red(str(inputs.keys()))
+        logger.warning(str(inputs.keys()))
     breakpoint()
     return inputs
 
@@ -417,10 +447,10 @@ def wrapped_model_name_matcher(model: str) -> str:
             backend = k.split("_API_KEY")[0].lower()
             if (
                 backend not in all_backends
-                and is_verbose
+                and env.WDOC_VERBOSE
                 and not printed_unexpected_api_keys[0]
             ):
-                yel(
+                logger.debug(
                     f"Found API_KEY for backend {backend} that is not a known backend for litellm."
                 )
             else:
@@ -452,7 +482,7 @@ def wrapped_model_name_matcher(model: str) -> str:
     if match:
         return match[0]
     else:
-        red(
+        logger.warning(
             f"Couldn't match the modelname {model} to any known model. "
             "Continuing but this will probably crash wdoc further "
             "down the code."
@@ -460,6 +490,7 @@ def wrapped_model_name_matcher(model: str) -> str:
         return model
 
 
+@memoize
 @optional_typecheck
 def model_name_matcher(model: str) -> str:
     """find the best match for a modelname (wrapper that checks if the matched
@@ -468,56 +499,242 @@ def model_name_matcher(model: str) -> str:
     """
     assert "testing" not in model
     assert "/" in model, f"expected / in model '{model}'"
-    if WDOC_NO_MODELNAME_MATCHING:
-        whi(f"Bypassing model name matching for model '{model}'")
+    if env.WDOC_NO_MODELNAME_MATCHING:
+        # logger.debug(f"Bypassing model name matching for model '{model}'")
         return model
 
     out = wrapped_model_name_matcher(model)
     if out != model and is_verbose:
-        yel(f"Matched model name {model} to {out}")
+        logger.debug(f"Matched model name {model} to {out}")
     assert (
         out in litellm.model_cost or out.split("/", 1)[1] in litellm.model_cost
     ), f"Neither {out} nor {out.split('/', 1)[1]} found in litellm.model_cost"
     return out
 
 
+@memoize
+@optional_typecheck
+def get_openrouter_metadata() -> dict:
+    """fetch the metadata from openrouter, because litellm takes always too much time to add new models."""
+    url = "https://openrouter.ai/api/v1/models"
+    response = requests.get(url)
+    rep = response.json()
+    # put it in a suitable format
+    data = {}
+    for info in rep["data"]:
+        modelid = "openrouter/" + info["id"]
+        assert modelid not in data, modelid
+        del info["id"]
+        pricing = info["pricing"]  # fix pricing is a str originally
+        for k, v in pricing.items():
+            pricing[k] = float(v)
+        data[modelid] = info
+
+        # for models that for example end with ":free", make them appear
+        # under their full name too
+        while ":" in modelid:
+            modelid = modelid[::-1].split(":")[0][::-1]
+            if modelid not in data:
+                data[modelid] = info
+
+    # Example of output:
+    # {'id': 'microsoft/phi-4-reasoning-plus:free',
+    #  'name': 'Microsoft: Phi 4 Reasoning Plus (free)',
+    #  'created': 1746130961,
+    #  'description': REMOVED
+    #  'context_length': 32768,
+    #  'architecture': {'modality': 'text->text',
+    #   'input_modalities': ['text'],
+    #   'output_modalities': ['text'],
+    #   'tokenizer': 'Other',
+    #   'instruct_type': None},
+    #  'pricing': {'prompt': '0',
+    #   'completion': '0',
+    #   'request': '0',
+    #   'image': '0',
+    #   'web_search': '0',
+    #   'internal_reasoning': '0'},
+    #  'top_provider': {'context_length': 32768,
+    #   'max_completion_tokens': None,
+    #   'is_moderated': False},
+    #  'per_request_limits': None,
+    #  'supported_parameters': ['max_tokens',
+    #   'temperature',
+    #   'top_p',
+    #   'reasoning',
+    #   'include_reasoning',
+    #   'stop',
+    #   'frequency_penalty',
+    #   'presence_penalty',
+    #   'seed',
+    #   'top_k',
+    #   'min_p',
+    #   'repetition_penalty',
+    #   'logprobs',
+    #   'logit_bias',
+    #   'top_logprobs']}
+    return data
+
+
+@dataclass
+class ModelName:
+    "Simply stores the different way to phrase a model name"
+
+    original: str
+    backend: str = field(init=False)
+    model: str = field(init=False)
+    sanitized: str = field(init=False)
+
+    def __post_init__(self):
+        assert (
+            "/" in self.original
+        ), f"Modelname must contain a / to distinguish the backend from the model. Received '{self.original}'"
+        self.backend, self.model = self.original.split("/", 1)
+        self.backend = self.backend.lower()
+
+        # Use a sanitized name for the cache path
+        self.sanitized = self.original
+        if "/" in self.model:
+            try:
+                if Path(self.model).exists():
+                    with open(
+                        Path(self.model).resolve().absolute().__str__(), "rb"
+                    ) as f:
+                        h = hashlib.sha256(f.read() + str(self.model)).hexdigest()[:15]
+                    self.sanitized = Path(self.model).name + "_" + h
+            except Exception:
+                pass
+        self.sanitized = self.sanitized.replace("/", "_")
+        if env.WDOC_PRIVATE_MODE:
+            self.sanitized = "private_" + self.sanitized
+
+    def is_testing(self) -> bool:
+        "Return True if the model is 'testing/testing'."
+        if "testing" in self.original.lower():
+            return True
+        return False
+
+    def __hash__(self):
+        # necessary for memoizing
+        return (str(self.original.__hash__()) + str("ModelName".__hash__())).__hash__()
+
+
+@memoize
+@optional_typecheck
+def get_model_price(model: ModelName) -> Dict[str, Union[float, int]]:
+    if env.WDOC_ALLOW_NO_PRICE:
+        logger.warning(
+            f"Disabling price computation for {model} because env var 'WDOC_ALLOW_NO_PRICE' is 'true'"
+        )
+        return {"prompt": 0, "completion": 0, "internal_reasoning": 0}
+
+    if model.backend == "ollama":
+        return {"prompt": 0, "completion": 0, "internal_reasoning": 0}
+    elif model.is_testing():
+        return {"prompt": 0, "completion": 0, "internal_reasoning": 0}
+    elif model.backend == "openrouter":
+        metadata = get_openrouter_metadata()
+        assert model.original in metadata, f"Missing {model} from openrouter"
+        pricing = metadata[model.original]["pricing"]
+        if "request" in pricing and pricing["request"]:
+            logger.error(
+                f"Found non 0 request for {model}, this is not supported by wdoc so the price will not be accurate"
+            )
+        return pricing
+
+    for key in ["original", "model", "sanitized"]:
+        mod = getattr(model, key)
+        if mod in litellm.model_cost:
+            pricing = litellm.model_cost[mod]
+            output = {}
+            output["prompt"] = pricing["input_cost_per_token"]
+            output["completion"] = pricing["output_cost_per_token"]
+            if "output_cost_per_reasoning_token" in pricing:
+                output["internal_reasoning"] = pricing[
+                    "output_cost_per_reasoning_token"
+                ]
+            else:
+                output["internal_reasoning"] = 0
+            for k, v in pricing.items():
+                if k not in output:
+                    output[k] = v
+            return output
+    raise Exception(
+        f"Can't find the price of '{model}'\nUpdate litellm or set WDOC_ALLOW_NO_PRICE=True if you still want to use this model."
+    )
+
+
+@memoize
+@optional_typecheck
+def get_model_max_tokens(modelname: ModelName) -> int:
+    if modelname.backend == "openrouter":
+        openrouter_data = get_openrouter_metadata()
+        assert (
+            modelname.original in openrouter_data
+        ), f"Missing model {modelname.original} from openrouter metadata"
+        return openrouter_data[modelname.original]["context_length"]
+
+    if modelname.original in litellm.model_cost:
+        return litellm.model_cost[modelname.original]["max_tokens"]
+    elif (trial := modelname.model) in litellm.model_cost:
+        return litellm.model_cost[trial]["max_tokens"]
+    elif (trial2 := modelname.model.split("/")[-1]) in litellm.model_cost:
+        return litellm.model_cost[trial2]["max_tokens"]
+    else:
+        try:
+            return litellm.get_model_info(modelname.original)["max_tokens"]
+        except Exception:
+            return litellm.get_model_info(modelname.name)[
+                "max_tokens"
+            ]  # crash if still not found
+
+
 @optional_typecheck
 def get_tkn_length(
     tosplit: str,
-    modelname: str = "gpt-3.5-turbo",
+    modelname: Union[str, ModelName] = "gpt-3.5-turbo",
 ) -> int:
+    if isinstance(modelname, ModelName):
+        modelname = modelname.original
     modelname = modelname.replace("openrouter/", "")
     return litellm.token_counter(model=modelname, text=tosplit)
 
 
 text_splitters = {}
 
+DEFAULT_SPLITTER_MODELNAME = ModelName("openai/gpt-3.5-turbo")
+
 
 @optional_typecheck
 def get_splitter(
     task: str,
-    modelname="gpt-3.5-turbo",
+    modelname: ModelName = DEFAULT_SPLITTER_MODELNAME,
 ) -> TextSplitter:
     "we don't use the same text splitter depending on the task"
     # avoid creating many times this object
     if task not in text_splitters:
         text_splitters[task] = {}
-    if modelname in text_splitters[task]:
-        return text_splitters[task][modelname]
+    if modelname.original in text_splitters[task]:
+        return text_splitters[task][modelname.original]
 
-    if modelname == "testing/testing":
-        return get_splitter(task=task, modelname="gpt-3.5-turbo")
+    if modelname.original == "testing/testing":
+        return get_splitter(task=task, modelname=DEFAULT_SPLITTER_MODELNAME)
 
     try:
-        max_tokens = litellm.get_model_info(modelname)["max_input_tokens"]
+        if modelname.model == "gpt-3.5-turbo":
+            max_tokens = 4096
+        else:
+            max_tokens = get_model_max_tokens(modelname)
 
         # don't use overly large chunks anyway
-        max_tokens = min(max_tokens, WDOC_MAX_CHUNK_SIZE)
+        max_tokens = min(max_tokens, env.WDOC_MAX_CHUNK_SIZE)
     except Exception as err:
         max_tokens = 4096
-        red(f"Failed to get max_tokens limit for model {modelname}: '{err}'")
+        logger.warning(
+            f"Failed to get max_tokens limit for model {modelname.original}: '{err}'"
+        )
 
-    model_tkn_length = partial(get_tkn_length, modelname=modelname)
+    model_tkn_length = partial(get_tkn_length, modelname=modelname.original)
 
     if task in ["query", "search"]:
         text_splitter = RecursiveCharacterTextSplitter(
@@ -543,7 +760,7 @@ def get_splitter(
     else:
         raise Exception(task)
 
-    text_splitters[task][modelname] = text_splitter
+    text_splitters[task][modelname.original] = text_splitter
     return text_splitter
 
 
@@ -562,14 +779,14 @@ def check_docs_tkn_length(
     size = sum([get_tkn_length(d.page_content) for d in docs])
     nline = len("\n".join([d.page_content for d in docs]).splitlines())
     if size <= min_token:
-        red(
+        logger.warning(
             f"Example of page from document with too few tokens : {docs[len(docs)//2].page_content}"
         )
         raise Exception(
             f"The number of token from '{identifier}' is {size} <= {min_token}, probably something went wrong?"
         )
     if size >= max_token:
-        red(
+        logger.warning(
             f"Example of page from document with too many tokens : {docs[len(docs)//2].page_content}"
         )
         raise Exception(
@@ -593,7 +810,7 @@ def check_docs_tkn_length(
         if str(err).startswith("Low language probability"):
             raise
         else:
-            red(
+            logger.warning(
                 f"Error when using language_detector on '{identifier}': {err}. Treating it as valid document."
             )
             return 1.0
@@ -605,13 +822,19 @@ def unlazyload_modules():
     """make sure no modules are lazy loaded. Useful when we wan't to make
     sure not to loose time and that everything works smoothly. For example
     who knows what happens when multiprocessing with lazy loaded modules."""
-    if WDOC_IMPORT_TYPE not in ["both", "lazy"]:
-        red("Lazyloading is disabled so not unlazyloading modules.")
+    if env.WDOC_IMPORT_TYPE not in ["both", "lazy"]:
+        logger.debug("Lazyloading is disabled so not unlazyloading modules.")
         return
 
     while True:
         found_one = False
         for k, v in sys.modules.items():
+            try:
+                str(v)
+            except Exception as e:
+                logger.warning(
+                    f"Very weird error when loading a package, consider setting WDOC_IMPORT_TYPE to another value than '{env.WDOC_IMPORT_TYPE}'. Error message was '{e}'"
+                )
             if "Lazily-loaded" in str(v):
                 try:
                     dir(v)  # this is enough to trigger the loading
@@ -638,7 +861,7 @@ def disable_internet(allowed: dict) -> None:
     --private is used, we overload the socket module to make it only able to
     reach local connection.
     """
-    red(
+    logger.warning(
         "Disabling outgoing internet because private mode is on. "
         "The only allowed IPs from now on are the ones from the "
         "argument llm_api_bases. Note that this permanently filters "
@@ -717,7 +940,7 @@ def disable_internet(allowed: dict) -> None:
         ip = socket.gethostbyname("www.google.com")
         skip = False
     except Exception as err:
-        red(
+        logger.warning(
             "Failed to get IP address of www.google.com to check if it is "
             "indeed blocked. You probably did this on purpose so not "
             f"crashing. Error: '{err}'"
@@ -762,43 +985,91 @@ def set_func_signature(func: Callable) -> Callable:
     return new_func
 
 
-THIN = "<thinking>"
-THINE = "</thinking>"
+# Tag constants
+THIN = "<think>"
+THINE = "</think>"
 ANSW = "<answer>"
 ANSWE = "</answer>"
 
+# Pre-compiled regex patterns
+_THIN_REGEX = re.compile(f"{re.escape(THIN)}(.*){re.escape(THINE)}", re.DOTALL)
+_THIN_SUB_REGEX = re.compile(
+    f"{re.escape(THIN)}|{re.escape(THINE)}|{re.escape(ANSW)}|{re.escape(ANSWE)}"
+)
 
+
+@optional_typecheck
 def thinking_answer_parser(output: str, strict: bool = False) -> dict:
-    """separate the <thinking> and <answer> tags in an answer"""
+    """separate the <think> and <answer> tags in an answer"""
+    orig = copy(output)
     try:
-        # fix </answer> instead of <answer>
-        if ANSW not in output and output.count(ANSWE) == 2:
-            output = output.replace(ANSWE, ANSW, 1)
-        if THIN not in output and output.count(THINE) == 2:
-            output = output.replace(THINE, THIN, 1)
+        # some models like the geminis don't return their thinking output, sometimes
+        # by mistake they keep thinking anyway so we get THINE without THIN. Let's just add
+        # it at the beginning of output
+        if THINE in output and THIN not in output:
+            output = THIN + output
 
         if (THIN not in output) and (ANSW not in output):
             assert (
                 THINE not in output
-            ), f"Output contains unexpected {THINE}:\n'''\n{output}\n'''"
+            ), f"Output contains no {THIN} nor {ANSW} but an unexpected {THINE}:\n'''\n{output}\n'''"
             assert (
                 ANSWE not in output
-            ), f"Output contains unexpected {ANSWE}:\n'''\n{output}\n'''"
+            ), f"Output contains no {THIN} nor {ANSW} but an unexpected {ANSWE}:\n'''\n{output}\n'''"
 
+            logger.debug(f"LLM output contained neither {THIN} nor {ANSW}")
             return {"thinking": "", "answer": output}
 
         thinking = ""
-        if THIN in output and THINE in output:
-            thinking = output.split(THIN, 1)[1].split(THINE, 1)[0].strip()
+        if (
+            THIN in output and THINE in output
+        ):  # meaning we found the expected <think> </think> block
+            thinking_match = _THIN_REGEX.search(output)
+            if thinking_match:
+                thinking = thinking_match.group(1)
+                if not (THIN not in thinking and THINE not in thinking):
+                    logger.warning(
+                        f"Found {THINK} or {THINE} inside the thinking block, we don't expect nested thinkings but will proceed anyway."
+                    )
+        else:
+            # check we don't have only one of the xml sides
+            assert (
+                THIN not in output and THINE not in output
+            ), f"Found only one of '{THIN}' or '{THINE}' in LLM output"
+            logger.debug("LLM output contained no thinking block")
 
         answer = ""
-        if ANSW in output and ANSWE in output:
-            answer = (
-                output.replace(thinking, "")
-                .split(ANSW, 1)[1]
-                .split(ANSWE, 1)[0]
-                .strip()
-            )
+        if (
+            ANSW in output and ANSWE in output
+        ):  # meaning we found the expected <answer> </answer> block
+            # Create a version without the thinking part
+            answer_text = output
+            if thinking:
+                answer_text = re.sub(re.escape(thinking), "", answer_text)
+            # Remove the xml sides
+            answer = _THIN_SUB_REGEX.sub("", answer_text)
+            logger.debug("LLM output contained answer block")
+        else:
+            # check we don't have only one of the xml sides
+            assert (
+                ANSW not in output and ANSWE not in output
+            ), f"Found only one of '{ANSW}' or '{ANSWE}' in LLM output"
+            if thinking:
+                logger.debug(
+                    "LLM output contained no answer block, assuming it's all but the thinking"
+                )
+                answer = (
+                    output.replace(thinking, "").replace(THIN, "").replace(THINE, "")
+                )
+            else:
+                logger.debug(
+                    "LLM output contained no answer block, assuming it's all the output"
+                )
+                answer = output
+
+        output = output.strip()
+        thinking = thinking.strip()
+        answer = answer.rstrip()
 
         assert (
             THIN not in answer
@@ -806,6 +1077,12 @@ def thinking_answer_parser(output: str, strict: bool = False) -> dict:
         assert (
             THINE not in answer
         ), f"Parsed answer contained unexpected {THIN}:\n'''\n{output}\n'''"
+        assert (
+            THIN not in thinking
+        ), f"Parsed thinking contained unexpected {THIN}:\n'''\n{output}\n'''"
+        assert (
+            THINE not in thinking
+        ), f"Parsed thinking contained unexpected {THIN}:\n'''\n{output}\n'''"
         assert (
             ANSW not in answer
         ), f"Parsed answer contained unexpected {ANSW}:\n'''\n{output}\n'''"
@@ -821,10 +1098,10 @@ def thinking_answer_parser(output: str, strict: bool = False) -> dict:
             strict
         ):  # otherwise combining answers could snowball into losing lots of text
             raise
-        red(
-            f"Error when parsing LLM output to get thinking and answer part.\nError: '{err}'\nOriginal output: '{output}'\nWill continue if not using --debug"
+        logger.warning(
+            f"Error when parsing LLM output to get thinking and answer part.\nError: '{err}'\nOriginal output: '{orig}'\nNote: if the output seems fine but ends abruptly instead of by </answer> you might want to tweak the max_token settings.\nWill continue if not using --debug"
         )
-        if is_debug:
+        if env.WDOC_DEBUG:
             raise
         else:
             assert output.strip(), "LLM output was empty"
@@ -835,7 +1112,7 @@ def thinking_answer_parser(output: str, strict: bool = False) -> dict:
 The following LLM answer might have had a problem during parsing
 </note>
 <output>
-{output}
+{orig}
 </output>
 """.strip(),
             }
@@ -845,20 +1122,44 @@ The following LLM answer might have had a problem during parsing
 langfuse_callback_holder = []
 
 
+@optional_typecheck
 def create_langfuse_callback(version: str) -> None:
+    assert not env.WDOC_PRIVATE_MODE
+    # replace langfuse's env variable if set for wdoc, this is already done in env.py but doing it here also at runtime
+    for k in [
+        "LANGFUSE_PUBLIC_KEY",
+        "LANGFUSE_SECRET_KEY",
+        "LANGFUSE_HOST",
+    ]:
+        newk = "WDOC_" + k
+        if newk in os.environ and os.environ[newk]:
+            os.environ[k] = os.environ[newk]
     if (
         "LANGFUSE_PUBLIC_KEY" in os.environ
         and "LANGFUSE_SECRET_KEY" in os.environ
         and "LANGFUSE_HOST" in os.environ
-    ) and not is_private:
-        red("Activating langfuse callbacks")
+    ):
+        logger.debug("Activating langfuse callbacks")
         try:
-            # # use litellm's callbacks for chatlitellm backend
             import langfuse
+        except ImportError as e:
+            if (
+                "WDOC_LANGFUSE_PUBLIC_KEY" in os.environ
+                and "redacted" not in os.environ.get("WDOC_LANGFUSE_PUBLIC_KEY", "")
+            ):
+                raise Exception(
+                    f"Couldn't import langfuse even though WDOC_LANGFUSE environment variables appear set. Crashing."
+                ) from e
+            else:
+                logger.warning(
+                    f"Failed to setup langfuse callback because of ImportError, make sure package 'langfuse' is installed. The error was: '{e}'"
+                )
+        try:
+            # use litellm's callbacks for chatlitellm backend
             import litellm
 
-            litellm.success_callback = ["langfuse"]
-            litellm.failure_callback = ["langfuse"]
+            litellm.success_callback.append("langfuse")
+            litellm.failure_callback.append("langfuse")
 
             # # and use langchain's callback for openai's backend
             # BUT as of october 2024 it seems buggy with chatlitellm, the modelname does not seem to be passed?
@@ -873,12 +1174,13 @@ def create_langfuse_callback(version: str) -> None:
             )
             langfuse_callback_holder.append(langfuse_callback)
         except Exception as e:
-            red(
-                f"Failed to setup langfuse callback, make sure package 'langfuse' is installed. The error was: ''{e}'"
+            logger.warning(
+                f"Failed to setup langfuse callback, make sure package 'langfuse' is installed. The error was: '{e}'"
             )
 
 
-def seconds_to_timecode(inp: str) -> str:
+@optional_typecheck
+def seconds_to_timecode(inp: Union[str, float, int]) -> str:
     "used for vtt subtitle conversion"
     second = float(inp)
     minute = second // 60
@@ -889,15 +1191,155 @@ def seconds_to_timecode(inp: str) -> str:
     return f"{hour:02d}:{minute:02d}:{second:02d}"
 
 
-def timecode_to_second(inp: str) -> float:
+@optional_typecheck
+def timecode_to_second(inp: str) -> int:
     "turns a vtt timecode into seconds"
     hour, minute, second = map(int, inp.split(":"))
     return hour * 3600 + minute * 60 + second
 
 
-def is_timecode(inp: str) -> bool:
+@optional_typecheck
+def is_timecode(inp: Union[float, str]) -> bool:
     try:
         timecode_to_second(inp)
         return True
     except Exception:
         return False
+
+
+@memoize
+@optional_typecheck
+def get_supported_model_params(modelname: ModelName) -> list:
+    if modelname.backend == "testing":
+        return []
+    if modelname.backend == "openrouter":
+        metadata = get_openrouter_metadata()
+        assert (
+            modelname.original in metadata
+        ), f"Missing {modelname.original} from openrouter"
+        return metadata[modelname.original]["supported_parameters"]
+
+    for test in [
+        modelname.original,
+        modelname.model,
+        model_name_matcher(modelname.original),
+    ]:
+        params = litellm.get_supported_openai_params(test)
+        if params:
+            return params
+    for test in [
+        modelname.original,
+        modelname.model,
+        model_name_matcher(modelname.original),
+    ]:
+        params = litellm.get_supported_openai_params(
+            test, custom_llm_provider=modelname.backend
+        )
+        if params:
+            return params
+    for test in [
+        modelname.original,
+        modelname.model,
+        model_name_matcher(modelname.original),
+    ]:
+        params = litellm.get_supported_openai_params(
+            test, custom_llm_provider="openrouter"
+        )
+        if params:
+            return params
+    return []
+
+
+@optional_typecheck
+def cache_file_in_memory(file_path: Path, recursive: bool = False) -> bool:
+    """
+    Advise the Linux kernel to cache the given file in memory.
+
+    Args:
+        file_path: Path to the file or directory to cache
+        recursive: If True and file_path is a directory, cache all files within it
+
+    Returns:
+        bool: True if caching was successful, False otherwise
+    """
+    # Check if we're on Linux
+    if platform.system() != "Linux":
+        # This function only works on Linux systems.
+        return False
+
+    files_to_cache: List[Path] = []
+
+    # Handle directory case
+    if file_path.is_dir():
+        if not recursive:
+            # Warning: {file_path} is a directory. Set recursive=True to cache all files.
+            return False
+        # Collect all files recursively
+        files_to_cache = [f for f in file_path.rglob("*") if f.is_file()]
+    elif file_path.is_file():
+        files_to_cache = [file_path]
+    else:
+        # Error: {file_path} does not exist.
+        return False
+
+    success = True
+    for file in files_to_cache:
+        try:
+            fd = os.open(str(file), os.O_RDONLY)
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_WILLNEED)
+            os.close(fd)
+        except Exception as e:
+            # logger.warning(f"Failed to cache {file}: {e}")
+            success = False
+
+    return success
+
+
+def log_and_time_fn(fn: Callable) -> Callable:
+    def wrapper(*args, **kwargs):
+        logger.debug(f"Enterring {fn}")
+        val = fn(*args, **kwargs)
+        logger.debug(f"Exiting {fn}")
+        return val
+
+    wrapped = wraps(fn)(wrapper)
+    return wrapped
+
+
+@optional_typecheck
+def get_piped_input() -> Optional[Any]:
+    """
+    Read data from stdin/pipes.
+    This is done when importing wdoc, to avoid any issues with parallelism
+    and threads etc.
+    The content is added to the commandline starting wdoc directly in
+    __main__.py.
+    """
+    # Check if data is being piped (stdin is not a terminal)
+    if not is_input_piped:
+        return None
+    # Save a copy of the original stdin for debugging
+    # original_stdin = sys.stdin
+
+    # Read the piped data
+    piped_input = sys.stdin.buffer.read()
+    try:
+        piped_input = piped_input.decode()
+    except Exception:
+        pass
+
+    # Create a new file descriptor for stdin from /dev/tty if available
+    # This allows breakpoint() to work later
+    try:
+        if os.name != "nt":  # Unix-like systems
+            sys.stdin = open("/dev/tty")
+        else:  # Windows
+            # On Windows this is trickier, consider using a different approach
+            pass
+
+    except:
+        # If we can't reopen stdin, at least return the data
+        pass
+
+    logger.debug("Loaded piped data")
+    return piped_input

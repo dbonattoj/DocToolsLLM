@@ -28,67 +28,59 @@ from langchain.retrievers import ContextualCompressionRetriever
 from langchain.retrievers.document_compressors import DocumentCompressorPipeline
 from langchain.retrievers.merger_retriever import MergerRetriever
 from langchain_community.document_transformers import EmbeddingsRedundantFilter
-from langchain_community.llms import FakeListLLM
+from langchain_community.chat_models.fake import FakeListChatModel
 from langchain_community.retrievers import KNNRetriever, SVMRetriever
 from langchain_core.output_parsers.string import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough, chain
 from langchain_core.runnables.base import RunnableEach
 from tqdm import tqdm
+from loguru import logger as logger
 
 from .utils.batch_file_loader import batch_load_doc
 from .utils.customs.fix_llm_caching import SQLiteCacheFixed
-from .utils.embeddings import load_embeddings
-from .utils.env import (
-    WDOC_ALLOW_NO_PRICE,
-    WDOC_DEBUGGER,
-    WDOC_DEFAULT_EMBED_MODEL,
-    WDOC_DEFAULT_MODELNAME,
-    WDOC_DEFAULT_QUERY_EVAL_MODELNAME,
-    WDOC_LLM_MAX_CONCURRENCY,
-    WDOC_OPEN_ANKI,
-    WDOC_TYPECHECKING,
-)
+from .utils.embeddings import create_embeddings, load_embeddings_engine
+from .utils.env import env, is_out_piped
 from .utils.errors import (
     NoDocumentsAfterLLMEvalFiltering,
     NoDocumentsRetrieved,
     ShouldIncreaseTopKAfterLLMEvalFiltering,
 )
-from .utils.flags import is_debug, is_private, is_verbose
+
 from .utils.interact import ask_user
 from .utils.llm import TESTING_LLM, load_llm
 
 # import this first because it sets the logging level
 from .utils.logger import (
-    cache_dir,
     log_dir,
-    logger,
     md_printer,
-    red,
-    set_USAGE_as_docstring,
-    whi,
-    yel,
+    set_help_md_as_docstring,
+    set_parse_file_help_md_as_docstring,
 )
 from .utils.misc import (  # debug_chain,
+    cache_dir,
     DocDict,
-    ankiconnect,
+    ModelName,
     average_word_length,
     check_docs_tkn_length,
     create_langfuse_callback,
     disable_internet,
     extra_args_types,
+    get_model_price,
     get_splitter,
+    get_supported_model_params,
     get_tkn_length,
     model_name_matcher,
     query_eval_cache,
     set_func_signature,
     thinking_answer_parser,
     wpm,
+    tasks_list,
 )
 from .utils.prompts import prompts
 from .utils.retrievers import create_multiquery_retriever, create_parent_retriever
 from .utils.tasks.query import (
     check_intermediate_answer,
-    collate_intermediate_answers,
+    collate_relevant_intermediate_answers,
     parse_eval_output,
     pbar_chain,
     pbar_closer,
@@ -105,13 +97,15 @@ os.environ["TOKENIZERS_PARALLELISM"] = "true"
 
 
 @optional_typecheck
-@set_USAGE_as_docstring
+@set_help_md_as_docstring
 class wdoc:
-    "This docstring is dynamically appended the content of wdoc/docs/USAGE.md"
+    """
+    This docstring is dynamically updated with the content of wdoc/docs/help.md
+    """
 
-    VERSION: str = "2.5.0"
+    VERSION: str = "3.2.1"
     allowed_extra_args = extra_args_types
-    md_printer = md_printer
+    __import_mode__: bool = True
 
     @optional_typecheck
     @set_func_signature
@@ -119,17 +113,19 @@ class wdoc:
         self,
         task: Literal["query", "search", "summarize", "summarize_then_query"],
         filetype: str = "auto",
-        modelname: str = WDOC_DEFAULT_MODELNAME,
-        embed_model: str = WDOC_DEFAULT_EMBED_MODEL,
-        query_eval_modelname: Optional[str] = WDOC_DEFAULT_QUERY_EVAL_MODELNAME,
-        embed_kwargs: Optional[dict] = None,
+        model: str = env.WDOC_DEFAULT_MODEL,
+        model_kwargs: Optional[dict] = None,
+        query_eval_model: Optional[str] = env.WDOC_DEFAULT_QUERY_EVAL_MODEL,
+        query_eval_model_kwargs: Optional[dict] = None,
+        embed_model: str = env.WDOC_DEFAULT_EMBED_MODEL,
+        embed_model_kwargs: Optional[dict] = None,
         save_embeds_as: Union[str, Path] = "{user_cache}/latest_docs_and_embeddings",
         load_embeds_from: Optional[Union[str, Path]] = None,
         top_k: Union[str, int] = "auto_200_500",
         query: Optional[str] = None,
-        query_retrievers: str = "default_multiquery",
+        query_retrievers: str = "basic_multiquery",
         query_eval_check_number: int = 3,
-        query_relevancy: Union[float, int] = 0.0,
+        query_relevancy: Union[float, int] = -0.5,
         summary_n_recursion: int = 0,
         summary_language: str = "the same language as the document",  # <- the LLM will understand
         llm_verbosity: Union[bool, int] = False,
@@ -144,15 +140,15 @@ class wdoc:
         file_loader_n_jobs: int = -1,
         private: Union[bool, int] = False,
         llms_api_bases: Optional[Union[dict, str]] = None,
-        DIY_rolling_window_embedding: Union[bool, int] = False,
-        import_mode: Union[bool, int] = False,
-        disable_md_printing: bool = False,
+        out_file: Optional[Union[str, Path]] = None,
         oneoff: bool = False,
         silent: bool = False,
         version: bool = False,
         **cli_kwargs,
     ) -> None:
-        "This docstring is dynamically appended the content of wdoc/docs/USAGE.md"
+        """
+        This docstring is dynamically updated with the content of wdoc/docs/help.md
+        """
         if version:
             print(self.VERSION)
             return
@@ -175,7 +171,7 @@ class wdoc:
 
         self.ntfy = ntfy
 
-        if debug or WDOC_DEBUGGER:
+        if debug or env.WDOC_DEBUGGER or env.WDOC_DEBUG:
             debug_exceptions(instance=self)
 
         elif notification_callback:
@@ -193,19 +189,22 @@ class wdoc:
             sys.excepthook = print_exception
             faulthandler.enable()
 
-        red(pyfiglet.figlet_format("wdoc"))
+        from loguru import logger  # for some reason I have to reimport
+
+        # loguru here otherwise the next line fails!
+        logger.warning(pyfiglet.figlet_format("wdoc"))
 
         # make sure the extra args are valid
         for k in cli_kwargs:
             if k not in self.allowed_extra_args:
                 raise Exception(
-                    red(
+                    logger.warning(
                         f"Found unexpected keyword argument: '{k}'\nThe allowed arguments are {','.join(self.allowed_extra_args)}"
                     )
                 )
 
             # type checking of extra args
-            if WDOC_TYPECHECKING in ["crash", "warn"]:
+            if env.WDOC_TYPECHECKING in ["crash", "warn"]:
                 val = cli_kwargs[k]
                 # curr_type = type(val)
                 expected_type = self.allowed_extra_args[k]
@@ -218,18 +217,26 @@ class wdoc:
                         f"Cli_kwargs '{k}' is of type '{type(val)}' instead of '{expected_type}'"
                     )
 
-        if modelname == TESTING_LLM:
-            if modelname != TESTING_LLM:
-                red(
-                    f"Detected 'testing' model in {modelname}, setting it to '{TESTING_LLM}'"
+        if (
+            model == TESTING_LLM
+            or model == "testing"
+            or model.lower().startswith("testing")
+        ):
+            logger.warning(f"Detected 'testing' model in {model}")
+            model = TESTING_LLM
+            if query_eval_model != TESTING_LLM:
+                logger.warning(f"Setting the query_eval_model to {TESTING_LLM} too")
+                query_eval_model = TESTING_LLM
+            if "multiquery" in query_retrievers:
+                logger.warning(
+                    f"Removing 'multiquery' from the query_retrievers because using {TESTING_LLM}"
                 )
-                modelname = TESTING_LLM
-            else:
-                red(f"Detected 'testing' model in {modelname}")
-            if isinstance(query_eval_modelname, str):
-                if query_eval_modelname != TESTING_LLM:
-                    red(f"Setting the query_eval_modelname to {TESTING_LLM} too")
-                    query_eval_modelname = TESTING_LLM
+                query_retrievers = query_retrievers.replace("multiquery", "")
+            logger.warning(
+                f"Setting the query_relevancy to -1.0 because using {TESTING_LLM}"
+            )
+            query_relevancy = -1.0
+        query_retrievers = query_retrievers.replace("_", " ").strip().replace(" ", "_")
 
         # checking argument validity
         assert (
@@ -239,20 +246,15 @@ class wdoc:
             "loaded_embeddings" not in cli_kwargs
         ), "'loaded_embeddings' cannot be an argument as it is used internally"
         task = task.replace("summary", "summarize")
-        assert task in [
-            "query",
-            "search",
-            "summarize",
-            "summarize_then_query",
-        ], "invalid task value"
+        assert task in tasks_list, f"invalid task value: {task}"
         if task in ["summarize", "summarize_then_query"]:
             assert not load_embeds_from, "can't use load_embeds_from if task is summary"
         if task in ["query", "search", "summarize_then_query"]:
             assert (
-                query_eval_modelname is not None
-            ), "query_eval_modelname can't be None if doing RAG"
+                query_eval_model is not None
+            ), "query_eval_model can't be None if doing RAG"
         else:
-            query_eval_modelname = None
+            query_eval_model = None
         if filetype == "auto":
             assert (
                 "path" in cli_kwargs and cli_kwargs["path"]
@@ -260,33 +262,75 @@ class wdoc:
         elif filetype == "string":
             cli_kwargs["path"] = "empty placeholder"
         assert (
-            "/" in modelname
-        ), "modelname must be in litellm format: provider/model. For example 'openai/gpt-4o'"
-        if modelname != TESTING_LLM and modelname.split("/", 1)[0] not in list(
+            "/" in model
+        ), "model must be in litellm format: provider/model. For example 'openai/gpt-4o'"
+        if model != TESTING_LLM and model.split("/", 1)[0] not in list(
             litellm.models_by_provider.keys()
         ):
             raise Exception(
-                f"For model '{modelname}': backend not found in "
+                f"For model '{model}': backend not found in "
                 "litellm nor 'testing'.\nList of litellm providers/backend:\n"
-                f"{litellm.model_by_providers.keys()}"
+                f"{litellm.models_by_provider.keys()}"
             )
-        assert "/" in embed_model, "embed model must contain slash"
-        assert embed_model.split("/", 1)[0].lower() in [
-            "openai",
-            "sentencetransformers",
-            "huggingface",
-        ], "Backend of embeddings must be either openai, sentencetransformers or huggingface"
-        if embed_kwargs is None:
-            embed_kwargs = {}
-        if isinstance(embed_kwargs, str):
+        assert (
+            query_eval_check_number > 0
+        ), "query_eval_check_number value must be greater than 0"
+
+        # parse the model kwargs
+        if model_kwargs is None:
+            model_kwargs = {}
+        if isinstance(model_kwargs, str):
             try:
-                embed_kwargs = json.loads(embed_kwargs)
+                model_kwargs = json.loads(model_kwargs)
             except Exception as err:
                 raise Exception(
-                    f"Failed to parse embed_kwargs: '{embed_kwargs}'"
+                    f"Failed to parse model_kwargs: '{model_kwargs}'"
                 ) from err
-        assert isinstance(embed_kwargs, dict), f"Not a dict but {type(embed_kwargs)}"
-        assert query_eval_check_number > 0, "query_eval_check_number value"
+        assert isinstance(model_kwargs, dict), f"Not a dict but {type(model_kwargs)}"
+        if "tags" not in model_kwargs:
+            model_kwargs["tags"] = ["strong_model"]
+        else:
+            assert isinstance(
+                model_kwargs["tags"], list
+            ), f"Model kwargs 'tags' value must be a list. Got '{model_kwargs['tags']}'"
+            model_kwargs["tags"].append("strong_model")
+        self.model_kwargs = model_kwargs
+        if query_eval_model_kwargs is None:
+            query_eval_model_kwargs = {}
+        if isinstance(query_eval_model_kwargs, str):
+            try:
+                query_eval_model_kwargs = json.loads(query_eval_model_kwargs)
+            except Exception as err:
+                raise Exception(
+                    f"Failed to parse query_eval_model_kwargs: '{query_eval_model_kwargs}'"
+                ) from err
+        assert isinstance(
+            query_eval_model_kwargs, dict
+        ), f"Not a dict but {type(query_eval_model_kwargs)}"
+        assert (
+            "n" not in query_eval_model_kwargs
+        ), "Trying to set the 'n' argument using query_eval_model_kwargs, you should instead use the query_eval_check_number argument"
+        self.query_eval_model_kwargs = query_eval_model_kwargs
+        if "tags" not in query_eval_model_kwargs:
+            query_eval_model_kwargs["tags"] = ["eval_model"]
+        else:
+            assert isinstance(
+                query_eval_model_kwargs["tags"], list
+            ), f"Model kwargs 'tags' value must be a list. Got '{query_eval_model_kwargs['tags']}'"
+            query_eval_model_kwargs["tags"].append("eval_model")
+        if embed_model_kwargs is None:
+            embed_model_kwargs = {}
+        if isinstance(embed_model_kwargs, str):
+            try:
+                embed_model_kwargs = json.loads(embed_model_kwargs)
+            except Exception as err:
+                raise Exception(
+                    f"Failed to parse embed_model_kwargs: '{embed_model_kwargs}'"
+                ) from err
+        assert isinstance(
+            embed_model_kwargs, dict
+        ), f"Not a dict but {type(embed_model_kwargs)}"
+        self.embed_model_kwargs = embed_model_kwargs
 
         if llms_api_bases is None:
             llms_api_bases = {}
@@ -295,27 +339,31 @@ class wdoc:
                 llms_api_bases = json.loads(llms_api_bases)
             except Exception as err:
                 raise Exception(f"Error when parsing llms_api_bases as a dict: {err}")
-        assert isinstance(llms_api_bases, dict), "llms_api_bases must be a dict"
+        assert isinstance(
+            llms_api_bases, dict
+        ), "llms_api_bases must be a dict or be a string that can be parsed as a dict"
         for k in llms_api_bases:
             assert k in [
                 "model",
                 "query_eval_model",
-            ], f"Invalid k of llms_api_bases: {k}"
-        for k in ["model", "query_eval_model"]:
+                "embeddings",
+            ], f"Invalid k of llms_api_bases not in 'model', 'query_eval_model', 'embeddings': {k}"
+        for k in ["model", "query_eval_model", "embeddings"]:
             if k not in llms_api_bases:
                 llms_api_bases[k] = None
         if (
             llms_api_bases["model"] == llms_api_bases["query_eval_model"]
+            and llms_api_bases["model"] == llms_api_bases["embeddings"]
             and llms_api_bases["model"]
         ):
-            red(
-                "Setting litellm wide api_base because it's the same for model and query_eval_model"
+            logger.warning(
+                "Setting litellm wide api_base because it's the same for model, query_eval_model and embeddings"
             )
             litellm.api_base = llms_api_bases["model"]
         assert isinstance(
             private, bool
         ), "private arg should be a boolean, not {private}"
-        assert private == is_private
+        assert private == env.WDOC_PRIVATE_MODE
         if private:
             assert llms_api_bases[
                 "model"
@@ -326,18 +374,25 @@ class wdoc:
             os.environ["WDOC_PRIVATE_MODE"] = "true"
             for k in dict(os.environ):
                 if k.endswith("_API_KEY") or k.endswith("_API_KEYS"):
-                    red(
+                    logger.warning(
                         f"private mode enabled: overwriting '{k}' from environment variables just in case"
                     )
                     os.environ[k] = "REDACTED_BECAUSE_WDOC_IN_PRIVATE_MODE"
 
             if any("LANGFUSE_" in k for k in os.environ.keys()):
-                red("Disabled langfuse because using private mode.")
+                logger.warning("Disabled langfuse because using private mode.")
             os.environ["LANGFUSE_PUBLIC_KEY"] = "REDACTED_BECAUSE_WDOC_IN_PRIVATE_MODE"
             os.environ["LANGFUSE_SECRET_KEY"] = "REDACTED_BECAUSE_WDOC_IN_PRIVATE_MODE"
             os.environ["LANGFUSE_HOST"] = "REDACTED_BECAUSE_WDOC_IN_PRIVATE_MODE"
+            os.environ["WDOC_LANGFUSE_PUBLIC_KEY"] = (
+                "REDACTED_BECAUSE_WDOC_IN_PRIVATE_MODE"
+            )
+            os.environ["WDOC_LANGFUSE_SECRET_KEY"] = (
+                "REDACTED_BECAUSE_WDOC_IN_PRIVATE_MODE"
+            )
+            os.environ["WDOC_LANGFUSE_HOST"] = "REDACTED_BECAUSE_WDOC_IN_PRIVATE_MODE"
             if litellm.success_callback or litellm.failure_callback:
-                red("Disabled litellm callbacks because using private mode.")
+                logger.warning("Disabled litellm callbacks because using private mode.")
             litellm.success_callback = []
             litellm.failure_callback = []
 
@@ -348,16 +403,15 @@ class wdoc:
 
         else:
             os.environ["WDOC_PRIVATE_MODE"] = "false"
+            create_langfuse_callback(f"wdoc_{wdoc.VERSION}")
 
-        if (modelname != TESTING_LLM) and (not llms_api_bases["model"]):
-            modelname = model_name_matcher(modelname)
-        if (query_eval_modelname is not None) and (
-            not llms_api_bases["query_eval_model"]
-        ):
-            if modelname == TESTING_LLM:
-                assert query_eval_modelname == TESTING_LLM
+        if (model != TESTING_LLM) and (not llms_api_bases["model"]):
+            model = model_name_matcher(model)
+        if (query_eval_model is not None) and (not llms_api_bases["query_eval_model"]):
+            if model == TESTING_LLM:
+                assert query_eval_model == TESTING_LLM
             else:
-                query_eval_modelname = model_name_matcher(query_eval_modelname)
+                query_eval_model = model_name_matcher(query_eval_model)
 
         if query is True:
             # otherwise specifying --query and forgetting to add text fails
@@ -398,29 +452,27 @@ class wdoc:
             self.max_top_k = None
 
         # storing as attributes
-        self.modelbackend = modelname.split("/", 1)[0].lower()
-        self.modelname = modelname
-        if query_eval_modelname is not None:
-            self.query_eval_modelbackend = query_eval_modelname.split("/", 1)[0].lower()
-            self.query_eval_modelname = query_eval_modelname
+        self.model = ModelName(model)
+        self.model_supported_params = get_supported_model_params(self.model)
+        if query_eval_model is not None:
+            self.query_eval_model = ModelName(query_eval_model)
+        else:
+            self.query_eval_model = None
         self.task = task
         self.filetype = filetype
-        self.embed_model = embed_model
-        self.embed_kwargs = embed_kwargs
+        self.embed_model = ModelName(embed_model)
+        self.embed_model_kwargs = embed_model_kwargs
         self.save_embeds_as = save_embeds_as
         self.load_embeds_from = load_embeds_from
         self.top_k = top_k
-        self.query_retrievers = (
-            query_retrievers
-            if modelname != TESTING_LLM
-            else query_retrievers.replace("multiquery", "")
-        )
+        self.query_retrievers = query_retrievers
         self.query_eval_check_number = int(query_eval_check_number)
         self.query_relevancy = query_relevancy
         self.debug = debug
         self.verbose = verbose
         self.cli_kwargs = cli_kwargs
         self.llm_verbosity = llm_verbosity
+        self.out_file = out_file
         self.summary_n_recursion = summary_n_recursion
         self.summary_language = summary_language
         self.dollar_limit = dollar_limit
@@ -429,9 +481,13 @@ class wdoc:
         self.file_loader_parallel_backend = file_loader_parallel_backend
         self.file_loader_n_jobs = file_loader_n_jobs
         self.llms_api_bases = llms_api_bases
-        self.DIY_rolling_window_embedding = bool(DIY_rolling_window_embedding)
-        self.import_mode = import_mode
         self.oneoff = oneoff
+        self.latest_cost = 0  # used to keep track of the costs overall
+        if debug:
+            os.environ["WDOC_DEBUG"] = "true"
+            os.environ["WDOC_VERBOSE"] = "true"
+        elif verbose:
+            os.environ["WDOC_VERBOSE"] = "true"
 
         if disable_llm_cache:
             self.llm_cache = False
@@ -439,81 +495,57 @@ class wdoc:
             if not private:
                 self.llm_cache = SQLiteCacheFixed(
                     database_path=(cache_dir / "langchain_db").resolve().absolute(),
-                    verbose=is_verbose,
+                    verbose=env.WDOC_VERBOSE,
                 )
             else:
                 self.llm_cache = SQLiteCacheFixed(
                     database_path=(cache_dir / "private_langchain_db")
                     .resolve()
                     .absolute(),
-                    verbose=is_verbose,
+                    verbose=env.WDOC_VERBOSE,
                 )
             set_llm_cache(self.llm_cache)
 
-        if WDOC_ALLOW_NO_PRICE:
-            red(
-                f"Disabling price computation for {modelname} because env var 'WDOC_ALLOW_NO_PRICE' is 'true'"
-            )
-            self.llm_price = [0.0, 0.0]
-
-        elif llms_api_bases["model"]:
-            red(
+        if llms_api_bases["model"]:
+            logger.warning(
                 f"Disabling price computation for model because api_base for 'model' was modified to {llms_api_bases['model']}"
             )
-            self.llm_price = [0.0, 0.0]
-        elif modelname == TESTING_LLM:
-            red(
-                f"Disabling price computation for model because api_base for 'model' was modified to {llms_api_bases['model']}"
-            )
-            self.llm_price = [0.0, 0.0]
-        elif modelname in litellm.model_cost:
-            self.llm_price = [
-                litellm.model_cost[modelname]["input_cost_per_token"],
-                litellm.model_cost[modelname]["output_cost_per_token"],
-            ]
-        elif modelname.split("/", 1)[1] in litellm.model_cost:
-            self.llm_price = [
-                litellm.model_cost[modelname.split("/", 1)[1]]["input_cost_per_token"],
-                litellm.model_cost[modelname.split("/", 1)[1]]["output_cost_per_token"],
-            ]
+            self.llm_price = {"prompt": 0, "completion": 0, "internal_reasoning": 0}
         else:
-            raise Exception(red(f"Can't find the price of {modelname}"))
+            self.llm_price = get_model_price(self.model)
+        logger.debug(f"Detected price of '{self.model.original}': {self.llm_price}")
+        assert "prompt" in self.llm_price
+        assert "completion" in self.llm_price
+        assert "internal_reasoning" in self.llm_price
 
-        if query_eval_modelname is not None:
-            if WDOC_ALLOW_NO_PRICE:
-                red(
-                    f"Disabling price computation for {query_eval_modelname} because env var 'WDOC_ALLOW_NO_PRICE' is 'true'"
-                )
-                self.query_evalllm_price = [0.0, 0.0]
-            elif llms_api_bases["query_eval_model"]:
-                red(
+        if self.query_eval_model is not None:
+            if llms_api_bases["query_eval_model"]:
+                logger.warning(
                     "Disabling price computation for query_eval_model because api_base was modified"
                 )
-                self.query_evalllm_price = [0.0, 0.0]
-            elif query_eval_modelname in litellm.model_cost:
-                self.query_evalllm_price = [
-                    litellm.model_cost[query_eval_modelname]["input_cost_per_token"],
-                    litellm.model_cost[query_eval_modelname]["output_cost_per_token"],
-                ]
-            elif query_eval_modelname.split("/", 1)[1] in litellm.model_cost:
-                self.query_evalllm_price = [
-                    litellm.model_cost[query_eval_modelname.split("/", 1)[1]][
-                        "input_cost_per_token"
-                    ],
-                    litellm.model_cost[query_eval_modelname.split("/", 1)[1]][
-                        "output_cost_per_token"
-                    ],
-                ]
+                self.query_evalllm_price = {
+                    "prompt": 0,
+                    "completion": 0,
+                    "internal_reasoning": 0,
+                }
             else:
-                raise Exception(red(f"Can't find the price of {query_eval_modelname}"))
+                self.query_evalllm_price = get_model_price(self.query_eval_model)
+            logger.debug(
+                f"Detected price of '{self.query_eval_model.original}': {self.query_evalllm_price}"
+            )
 
-        if is_verbose:
+            assert "prompt" in self.query_evalllm_price
+            assert "completion" in self.query_evalllm_price
+            assert "internal_reasoning" in self.query_evalllm_price
+
+        if env.WDOC_VERBOSE:
             set_verbose(True)
-            litellm.set_verbose = True
+            os.environ["LITELLM_LOG"] = "DEBUG"
+            litellm._turn_on_debug()
 
             llm_verbosity = True
-            whi(f"Cache location: {cache_dir.absolute()}")
-            whi(f"Log location: {log_dir.absolute()}")
+            logger.info(f"Cache location: {cache_dir.absolute()}")
+            logger.info(f"Log location: {log_dir.absolute()}")
         else:
             set_verbose(False)
             set_debug(False)
@@ -535,8 +567,8 @@ class wdoc:
                 logger = logging.getLogger(logger_name)
                 logger.setLevel(logging.CRITICAL)
         if debug:
-            assert is_verbose
-            assert is_debug
+            assert env.WDOC_VERBOSE
+            assert env.WDOC_DEBUG
             # os.environ["LANGCHAIN_TRACING_V2"] = "true"
             set_debug(True)
 
@@ -559,16 +591,15 @@ class wdoc:
 
         # loading llm
         self.llm = load_llm(
-            modelname=self.modelname,
-            backend=self.modelbackend,
+            modelname=self.model,
             llm_cache=self.llm_cache,
             temperature=0,
             llm_verbosity=self.llm_verbosity,
             api_base=self.llms_api_bases["model"],
             private=self.private,
-            tags=["strong_model"],
+            **self.model_kwargs,
         )
-        # if "anthropic" in self.modelname.lower() or "anthropic" in self.backend.lower():
+        # if "anthropic" in self.model.lower() or "anthropic" in self.backend.lower():
         #     prompts.enable_prompt_caching("answer")
         #     prompts.enable_prompt_caching("combine")
         #     prompts.enable_prompt_caching("multiquery")
@@ -582,17 +613,16 @@ class wdoc:
                 "embed_instruct",
                 "filter_content",
                 "filter_metadata",
-                "out_file",
             ]:
                 if k in filtered_cli_kwargs:
                     del filtered_cli_kwargs[k]
 
             self.loaded_docs = batch_load_doc(
-                llm_name=self.modelname,
+                llm_name=self.model,
                 filetype=self.filetype,
                 task=self.task,
                 backend=self.file_loader_parallel_backend,
-                n_jobs=self.file_loader_n_jobs if not is_debug else 1,
+                n_jobs=self.file_loader_n_jobs if not env.WDOC_DEBUG else 1,
                 **filtered_cli_kwargs,
             )
         else:
@@ -601,24 +631,19 @@ class wdoc:
         if self.task in ["query", "search", "summary_then_query"]:
             self.prepare_query_task()
 
-        if self.import_mode:
-            if is_verbose:
-                whi(
-                    "Ready to query or summarize, call your_instance.query_task(your_question)"
-                )
+        if self.__import_mode__:
+            logger.debug(
+                "Ready to query or summarize, call your_instance.query_task(your_question)"
+            )
             return
 
         if self.task in ["summarize", "summarize_then_query"]:
             self.summary_task()
 
             if self.task == "summary_then_query":
-                whi("Done summarizing. Switching to query mode.")
-                if "logit_bias" in litellm.get_supported_openai_params(
-                    model=self.modelname,
-                ):
-                    del self.llm.model_kwargs["logit_bias"]
+                logger.info("Done summarizing. Switching to query mode.")
             else:
-                whi("Done summarizing.")
+                logger.info("Done summarizing.")
                 return
 
         else:
@@ -642,19 +667,30 @@ class wdoc:
                 docs_tkn_cost[meta] += get_tkn_length(doc.page_content)
 
         full_tkn = sum(list(docs_tkn_cost.values()))
-        red("Token price of each document:")
+        logger.warning("Token price of each document:")
         for k, v in docs_tkn_cost.items():
-            pr = v * (self.llm_price[0] * 4 + self.llm_price[1]) / 5
-            red(f"- {v:>6}: {k:>10} - ${pr:04f}")
+            pr = v * (self.llm_price["prompt"] * 4 + self.llm_price["completion"]) / 5
+            logger.warning(f"- {v:>6}: {k:>10} - ${pr:04f}")
 
-        red(f"Total number of tokens in documents to summarize: '{full_tkn}'")
+        logger.warning(
+            f"Total number of tokens in documents to summarize: '{full_tkn}'"
+        )
         # use an heuristic to estimate the price to summarize
-        adj_price = (self.llm_price[0] * 3 + self.llm_price[1] * 2) / 5
-        estimate_dol = full_tkn * adj_price / 100 * 1.2
+        compr_ratio = 0.28
+        prompt_tkn = 1000
+        estimate_dol = (prompt_tkn + full_tkn) * self.llm_price[
+            "prompt"
+        ] + full_tkn * compr_ratio * self.llm_price["completion"]
         if self.summary_n_recursion:
-            for i in range(1, self.summary_n_recursion + 1):
-                estimate_dol += full_tkn * ((2 / 5) ** i) * adj_price / 100 * 1.2
-        whi(
+            for i in range(self.summary_n_recursion):
+                estimate_dol += (prompt_tkn + full_tkn) * (
+                    compr_ratio**i
+                ) * self.llm_price["prompt"] + full_tkn * (
+                    compr_ratio ** (i + 1)
+                ) * self.llm_price[
+                    "completion"
+                ]
+        logger.info(
             self.ntfy(
                 f"Estimate of the LLM cost to summarize: ${estimate_dol:.4f} for {full_tkn} tokens."
             )
@@ -662,63 +698,16 @@ class wdoc:
         if estimate_dol > self.dollar_limit:
             if self.llms_api_bases["model"]:
                 raise Exception(
-                    red(
+                    logger.warning(
                         self.ntfy(
                             f"Cost estimate ${estimate_dol:.5f} > ${self.dollar_limit} which is absurdly high. Has something gone wrong? Quitting."
                         )
                     )
                 )
             else:
-                red(
+                logger.warning(
                     "Cost estimate > limit but the api_base was modified so not crashing."
                 )
-
-        llm_params = litellm.get_supported_openai_params(
-            model=self.modelname if self.modelbackend != "testing" else {}
-        )
-        if "logit_bias" in llm_params:
-            # increase likelyhood that chatgpt will use indentation by
-            # biasing towards adding space.
-            logit_val = 3
-            self.llm.model_kwargs["logit_bias"] = {
-                12: logit_val,  # '-'
-                # 220: logit_val,  # ' '
-                # 532: logit_val,  # ' -'
-                # 9: logit_val,  # '*'
-                # 1635: logit_val,  # ' *'
-                # 197: logit_val,  # '\t'
-                334: logit_val,  # '**'
-                # 25: logit_val,  # ':'
-                # 551: logit_val,  # ' :'
-                # 13: -1,  # '.'
-                # logit bias for indentation, the number of space, because it consumes less token than using \t
-                257: logit_val,  # "    "
-                260: logit_val,  # "        "
-                1835: logit_val,  # "            "
-                338: logit_val,  # "                "
-                3909: logit_val,  # "                    "
-                5218: logit_val,  # "                        "
-                6663: logit_val,  # "                            "
-                792: logit_val,  # "                                "
-                10812: logit_val,  # "                                    "
-                13137: logit_val,  # "                                        "
-                15791: logit_val,  # "                                            "
-                19273: logit_val,  # "                                                "
-                25343: logit_val,  # "                                                    "
-                29902: logit_val,  # "                                                        "
-                39584: logit_val,  # "                                                            "
-                5341: logit_val,  # "                                                                "
-                52168: logit_val,  # "                                                                    "
-                38244: logit_val,  # "                                                                        "
-                56899: logit_val,  # "                                                                            "
-                98517: logit_val,  # "                                                                                "
-            }
-        if "frequency_penalty" in llm_params:
-            self.llm.model_kwargs["frequency_penalty"] = 0.0
-        if "presence_penalty" in llm_params:
-            self.llm.model_kwargs["presence_penalty"] = 0.0
-        if "temperature" in llm_params:
-            self.llm.model_kwargs["temperature"] = 0.0
 
         @optional_typecheck
         def summarize_documents(
@@ -773,16 +762,13 @@ class wdoc:
             (
                 summary,
                 n_chunk,
-                doc_total_cost,
-                doc_total_tokens_in,
-                doc_total_tokens_out,
+                doc_total_tokens,
             ) = do_summarize(
                 docs=relevant_docs,
                 metadata=metadata,
                 language=self.summary_language,
-                modelbackend=self.modelbackend,
+                modelbackend=self.model.backend,
                 llm=self.llm,
-                llm_price=self.llm_price,
                 verbose=self.llm_verbosity,
             )
 
@@ -791,15 +777,14 @@ class wdoc:
                 [letter for letter in list(summary) if letter.isalpha()]
             )
             sum_reading_length = len(real_text) / average_word_length / wpm
-            whi(f"{item_name} reading length is {sum_reading_length:.1f}")
+            logger.info(f"{item_name} reading length is {sum_reading_length:.1f}")
 
             recursive_summaries = {0: summary}
             prev_real_text = MISSING
             if self.summary_n_recursion > 0:
                 for n_recur in range(1, self.summary_n_recursion + 1):
                     summary_text = copy.deepcopy(recursive_summaries[n_recur - 1])
-                    if not self.import_mode:
-                        red(f"Doing summary check #{n_recur} of {item_name}")
+                    logger.warning(f"Doing summary check #{n_recur} of {item_name}")
 
                     # remove any chunk count that is not needed to summarize
                     sp = summary_text.split("\n")
@@ -821,7 +806,7 @@ class wdoc:
 
                     splitter = get_splitter(
                         "recursive_summary",
-                        modelname=self.modelname,
+                        modelname=self.model,
                     )
                     summary_docs = [Document(page_content=summary_text)]
                     summary_docs = splitter.transform_documents(summary_docs)
@@ -829,29 +814,27 @@ class wdoc:
                     try:
                         check_docs_tkn_length(summary_docs, item_name)
                     except Exception as err:
-                        red(
+                        logger.warning(
                             f"Exception when checking if {item_name} could be recursively summarized for the #{n_recur} time: {err}"
                         )
                         break
                     (
                         summary_text,
                         n_chunk,
-                        new_doc_total_cost,
-                        new_doc_total_tokens_in,
-                        new_doc_total_tokens_out,
+                        new_doc_total_tokens,
                     ) = do_summarize(
                         docs=summary_docs,
                         metadata=metadata,
                         language=self.summary_language,
-                        modelbackend=self.modelbackend,
+                        modelbackend=self.model.backend,
                         llm=self.llm,
-                        llm_price=self.llm_price,
                         verbose=self.llm_verbosity,
                         n_recursion=n_recur,
                     )
-                    doc_total_tokens_in += new_doc_total_tokens_in
-                    doc_total_tokens_out += new_doc_total_tokens_out
-                    doc_total_cost += new_doc_total_cost
+
+                    # aggregate the token count
+                    for k, v in new_doc_total_tokens.items():
+                        doc_total_tokens[k] += v
 
                     # clean text again to compute the reading length
                     sp = summary_text.split("\n")
@@ -874,71 +857,80 @@ class wdoc:
                         [letter for letter in list(real_text) if letter.isalpha()]
                     )
                     sum_reading_length = len(real_text) / average_word_length / wpm
-                    whi(
+                    logger.info(
                         f"{item_name} reading length after recursion #{n_recur} is {sum_reading_length:.1f}"
                     )
                     if prev_real_text is not MISSING:
                         if real_text == prev_real_text:
-                            if not self.import_mode:
-                                red(
-                                    f"Identical summary after {n_recur} "
-                                    "recursion, adding more recursion will not "
-                                    "help so stopping here"
-                                )
+                            logger.warning(
+                                f"Identical summary after {n_recur} "
+                                "recursion, adding more recursion will not "
+                                "help so stopping here"
+                            )
                             recursive_summaries[n_recur] = summary_text
                             break
                     prev_real_text = real_text
 
                     assert n_recur not in recursive_summaries
                     if summary_text not in recursive_summaries:
-                        if not self.import_mode:
-                            red(
-                                f"Identical summary after {n_recur} "
-                                "recursion, adding more recursion will not "
-                                "help so stopping here"
-                            )
+                        logger.warning(
+                            f"Identical summary after {n_recur} "
+                            "recursion, adding more recursion will not "
+                            "help so stopping here"
+                        )
                         recursive_summaries[n_recur] = summary_text
                         break
                     else:
                         recursive_summaries[n_recur] = summary_text
 
             best_sum_i = max(list(recursive_summaries.keys()))
-            if not self.import_mode:
+            if not self.__import_mode__:
                 print("\n\n")
                 md_printer("# Summary")
                 md_printer(f"## {path}")
                 md_printer(recursive_summaries[best_sum_i])
 
-                doc_total_tokens = doc_total_tokens_in + doc_total_tokens_out
-                red(
-                    f"Tokens used for {path}: '{doc_total_tokens}' (in: {doc_total_tokens_in}, out: {doc_total_tokens_out}, cost: ${doc_total_cost:.5f})"
-                )
+            # the price computation needs to happen as late as possible to avoid
+            # underflow errors
+            doc_total_cost = 0
+            doc_total_tokens_str = ""
+            for k, v in doc_total_tokens.items():
+                if self.llm_price[k]:  # to avoid underflow errors:
+                    doc_total_cost += v * self.llm_price[k]
+                doc_total_tokens_str += f"{k.title()}: {v} "
+            doc_total_tokens_str = doc_total_tokens_str.strip()
+            logger.info(
+                f"Tokens used for {path}: ({doc_total_tokens_str}, cost: ${doc_total_cost:.5f})"
+            )
 
             summary_tkn_length = get_tkn_length(recursive_summaries[best_sum_i])
 
-            header = (
-                f"\n- {item_name}    cost: {doc_total_tokens} (${doc_total_cost:.5f})"
-            )
+            header = f"\n- {item_name}    cost: ${doc_total_cost:.5f} ({doc_total_tokens_str})"
             if doc_reading_length:
                 header += f"    {doc_reading_length:.1f} minutes"
             if author:
                 header += f"    by '{author}'"
             header += f"    original path: '{path}'"
-            header += f"    wdoc version {self.VERSION} with model {self.modelname}"
+            header += f"    wdoc version {self.VERSION} with model {self.model}"
 
             # save to output file
-            if "out_file" in self.cli_kwargs:
-                assert not self.import_mode, "Can't use import_mode with --out_file"
+            if self.out_file:
+                if self.__import_mode__:
+                    logger.warning(
+                        f"Detected use of out_file arg while in __import_mode__. This is unexpected and might lead to issues."
+                    )
                 for nrecur, sum in recursive_summaries.items():
-                    outfile = Path(self.cli_kwargs["out_file"])
+                    out_file = Path(self.out_file)
                     if len(recursive_summaries) > 1 and nrecur < max(
                         list(recursive_summaries.keys())
                     ):
                         # also store intermediate summaries if present
-                        outfile = outfile.parent / (outfile.stem + f".{nrecur + 1}.md")
+                        out_file = out_file.parent / (
+                            out_file.stem + f".{nrecur + 1}.md"
+                        )
 
-                    with open(str(outfile), "a") as f:
-                        if outfile.exists() and outfile.read_text().strip():
+                    with open(str(out_file), "a") as f:
+                        if out_file.exists() and out_file.read_text().strip():
                             f.write("\n\n\n")
                         f.write(header)
                         if len(recursive_summaries) > 1:
@@ -957,6 +949,7 @@ class wdoc:
                 "sum_tkn_length": summary_tkn_length,
                 "doc_reading_length": doc_reading_length,
                 "doc_total_tokens": doc_total_tokens,
+                "doc_total_tokens_str": doc_total_tokens_str,
                 "doc_total_cost": doc_total_cost,
                 "summary": recursive_summaries[best_sum_i],
                 "recursive_summaries": recursive_summaries,
@@ -969,33 +962,25 @@ class wdoc:
             relevant_docs=self.loaded_docs,
         )
 
-        if not self.import_mode:
-            red(
-                self.ntfy(
-                    f"Total cost of those summaries: {results['doc_total_tokens']} tokens for ${results['doc_total_cost']:.5f} (estimate was ${estimate_dol:.5f})"
-                )
-            )
-            red(
-                self.ntfy(
-                    f"Total time saved by those summaries: {results['doc_reading_length']:.1f} minutes"
-                )
-            )
-        else:
+        logger.info(
             self.ntfy(
-                f"Total cost of those summaries: '{results['doc_total_tokens']}' (${results['doc_total_cost']:.5f}, estimate was ${estimate_dol:.5f})"
+                f"Total cost of those summaries: {results['doc_total_tokens_str']} tokens for ${results['doc_total_cost']:.5f} (estimate was ${estimate_dol:.5f})"
             )
+        )
+        logger.info(
             self.ntfy(
                 f"Total time saved by those summaries: {results['doc_reading_length']:.1f} minutes"
             )
+        )
 
         llmcallback = self.llm.callbacks[0]
         total_cost = (
-            self.llm_price[0] * llmcallback.prompt_tokens
-            + self.llm_price[1] * llmcallback.completion_tokens
+            self.llm_price["prompt"] * llmcallback.prompt_tokens
+            + self.llm_price["completion"] * llmcallback.completion_tokens
         )
         if llmcallback.total_tokens != results["doc_total_tokens"]:
-            red(
-                f"Cost discrepancy? Tokens used according to the callback: '{llmcallback.total_tokens}' (${total_cost:.5f})"
+            logger.warning(
+                f"Cost discrepancy? Tokens used according to the callback: '{llmcallback.total_tokens}' vs in the result: '{results['doc_total_tokens']}' (${total_cost:.5f})"
             )
         self.summary_results = results
         self.latest_cost = total_cost
@@ -1003,70 +988,23 @@ class wdoc:
 
     @optional_typecheck
     def prepare_query_task(self) -> None:
-        # set argument that are better suited for querying
-        if "logit_bias" in litellm.get_supported_openai_params(
-            model=self.modelname,
-        ):
-            # increase likelyhood that chatgpt will use indentation by
-            # biasing towards adding space.
-            logit_val = 3
-            self.llm.model_kwargs["logit_bias"] = {
-                12: logit_val,  # '-'
-                # 220: logit_val,  # ' '
-                # 532: logit_val,  # ' -'
-                # 9: logit_val,  # '*'
-                # 1635: logit_val,  # ' *'
-                # 197: logit_val,  # '\t'
-                334: logit_val,  # '**'
-                # 25: logit_val,  # ':'
-                # 551: logit_val,  # ' :'
-                # 13: -1,  # '.'
-                # logit bias for indentation, the number of space, because it consumes less token than using \t
-                257: logit_val,  # "    "
-                260: logit_val,  # "        "
-                1835: logit_val,  # "            "
-                338: logit_val,  # "                "
-                3909: logit_val,  # "                    "
-                5218: logit_val,  # "                        "
-                6663: logit_val,  # "                            "
-                792: logit_val,  # "                                "
-                10812: logit_val,  # "                                    "
-                13137: logit_val,  # "                                        "
-                15791: logit_val,  # "                                            "
-                19273: logit_val,  # "                                                "
-                25343: logit_val,  # "                                                    "
-                29902: logit_val,  # "                                                        "
-                39584: logit_val,  # "                                                            "
-                5341: logit_val,  # "                                                                "
-                52168: logit_val,  # "                                                                    "
-                38244: logit_val,  # "                                                                        "
-                56899: logit_val,  # "                                                                            "
-                98517: logit_val,  # "                                                                                "
-            }
-        if "frequency_penalty" in litellm.get_supported_openai_params(
-            model=self.modelname,
-        ):
-            self.llm.model_kwargs["frequency_penalty"] = 0.0
-        if "presence_penalty" in litellm.get_supported_openai_params(
-            model=self.modelname,
-        ):
-            self.llm.model_kwargs["presence_penalty"] = 0.0
-        if "temperature" in litellm.get_supported_openai_params(
-            model=self.modelname,
-        ):
-            self.llm.model_kwargs["temperature"] = 0.0
-
         # load embeddings for querying
-        self.loaded_embeddings, self.embeddings = load_embeddings(
-            embed_model=self.embed_model,
-            embed_kwargs=self.embed_kwargs,
+        self.embedding_engine = load_embeddings_engine(
+            modelname=self.embed_model,
+            cli_kwargs=self.cli_kwargs,
+            api_base=self.llms_api_bases["embeddings"],
+            embed_kwargs=self.embed_model_kwargs,
+            private=self.private,
+            do_test=env.WDOC_EMBED_TESTING,
+        )
+        self.loaded_embeddings = create_embeddings(
+            modelname=self.embed_model,
+            cached_embeddings=self.embedding_engine,
             load_embeds_from=self.load_embeds_from,
             save_embeds_as=self.save_embeds_as,
             loaded_docs=self.loaded_docs,
             dollar_limit=self.dollar_limit,
             private=self.private,
-            use_rolling=self.DIY_rolling_window_embedding,
-            cli_kwargs=self.cli_kwargs,
         )
 
         # set default ask_user argument
@@ -1090,7 +1028,7 @@ class wdoc:
                     self.loaded_embeddings.docstore._dict.values(),
                     desc="gathering metadata keys",
                     unit="doc",
-                    disable=not is_verbose,
+                    disable=(not env.WDOC_VERBOSE) or is_out_piped,
                 ):
                     for k in doc.metadata.keys():
                         all_metadata_keys.add(k)
@@ -1284,16 +1222,18 @@ class wdoc:
                 self.loaded_embeddings.docstore._dict.items(),
                 desc="Filtering",
                 unit="docs",
-                disable=not is_verbose,
+                disable=(not env.WDOC_VERBOSE) or is_out_piped,
             ):
                 checked += 1
                 if filter_meta(doc.metadata) and filter_cont(doc.page_content):
                     good += 1
                 else:
                     ids_to_del.append(doc_id)
-            red(f"Keeping {good}/{checked} documents from vectorstore after filtering")
+            logger.warning(
+                f"Keeping {good}/{checked} documents from vectorstore after filtering"
+            )
             if good == checked:
-                red("Your filter matched all stored documents!")
+                logger.warning("Your filter matched all stored documents!")
             assert good, "No documents in the vectorstore match the given filter"
 
             # directly remove the filtered documents from the docstore
@@ -1318,13 +1258,18 @@ class wdoc:
             ), "Something went wrong when deleting filtered out documents"
 
     @optional_typecheck
-    def query_task(self, query: Optional[str]) -> dict:
+    def query_task(self, query: Optional[str] = None) -> dict:
         if not query:
             if self.oneoff:
-                raise SystemExit("Done")
+                sys.exit(0)
+            if is_out_piped:
+                logger.debug(
+                    "Exited query_task because we don't loop the queries when the output is a shell pipe"
+                )
+                sys.exit(0)
             query, self.interaction_settings = ask_user(self.interaction_settings)
         assert all(
-            retriev in ["default", "multiquery", "knn", "svm", "parent"]
+            retriev in ["basic", "multiquery", "knn", "svm", "parent"]
             for retriev in self.interaction_settings["retriever"].split("_")
         ), f"Invalid retriever value: {self.interaction_settings['retriever']}"
         retrievers = []
@@ -1346,7 +1291,7 @@ class wdoc:
             retrievers.append(
                 KNNRetriever.from_texts(
                     self.all_texts,
-                    self.embeddings,
+                    self.embedding_engine,
                     relevancy_threshold=self.interaction_settings["relevancy"],
                     k=self.interaction_settings["top_k"],
                 )
@@ -1355,7 +1300,7 @@ class wdoc:
             retrievers.append(
                 SVMRetriever.from_texts(
                     self.all_texts,
-                    self.embeddings,
+                    self.embedding_engine,
                     relevancy_threshold=self.interaction_settings["relevancy"],
                     k=self.interaction_settings["top_k"],
                 )
@@ -1371,7 +1316,7 @@ class wdoc:
                 )
             )
 
-        if "default" in self.interaction_settings["retriever"].lower():
+        if "basic" in self.interaction_settings["retriever"].lower():
             retrievers.append(
                 self.loaded_embeddings.as_retriever(
                     search_type="similarity_score_threshold",
@@ -1393,7 +1338,7 @@ class wdoc:
 
             # remove redundant results from the merged retrievers:
             filtered = EmbeddingsRedundantFilter(
-                embeddings=self.embeddings,
+                embeddings=self.embedding_engine,
                 similarity_threshold=0.999,
             )
             filter_pipeline = DocumentCompressorPipeline(transformers=[filtered])
@@ -1410,47 +1355,29 @@ class wdoc:
             query_an = sp[1].strip()
         else:
             query_fe, query_an = copy.copy(query), copy.copy(query)
-        whi(f"Query for the embeddings: {query_fe}")
-        whi(f"Question to answer: {query_an}")
+        logger.debug(f"Query for the embeddings: {query_fe}")
+        logger.debug(f"Question to answer: {query_an}")
 
         # answer 0 or 1 if the document is related
         if not hasattr(self, "eval_llm"):
-            failed = False
-            if self.query_eval_modelbackend == "openrouter":
-                try:
-                    self.eval_llm_params = litellm.get_supported_openai_params(
-                        model_name_matcher(self.query_eval_modelname.split("/", 1)[1])
-                    )
-                except Exception as err:
-                    failed = True
-                    red(
-                        f"Failed to get query_eval_model parameters information bypassing openrouter: '{err}'"
-                    )
-            if self.query_eval_modelbackend != "openrouter" or failed:
-                self.eval_llm_params = litellm.get_supported_openai_params(
-                    model=self.query_eval_modelname,
-                    custom_llm_provider=self.query_eval_modelbackend,
-                )
-            eval_args = {}
+            self.eval_llm_params = get_supported_model_params(self.query_eval_model)
+            eval_args = copy.deepcopy(self.query_eval_model_kwargs)
             if "n" in self.eval_llm_params:
                 eval_args["n"] = self.query_eval_check_number
-            elif self.query_eval_check_number > 1:
-                red(
-                    f"Model {self.query_eval_modelname} does not support parameter 'n' so will be called multiple times instead. This might cost more."
+            if self.query_eval_check_number > 1:
+                logger.warning(
+                    f"Model {self.query_eval_model.original} does not support parameter 'n' so will be called multiple times instead. This might cost more."
                 )
-                assert self.query_eval_modelbackend != "openai"
             self.eval_llm = load_llm(
-                modelname=self.query_eval_modelname,
-                backend=self.query_eval_modelbackend,
+                modelname=self.query_eval_model,
                 llm_cache=False,  # disables caching because another caching is used on top
                 llm_verbosity=self.llm_verbosity,
                 temperature=0 if self.query_eval_check_number == 1 else 1,
                 api_base=self.llms_api_bases["query_eval_model"],
                 private=self.private,
-                tags=["eval_model"],
                 **eval_args,
             )
-            # if "anthropic" in self.query_eval_modelname.lower() or "anthropic" in self.query_eval_modelbackend.lower():
+            # if "anthropic" in self.query_eval_model.original.lower() or "anthropic" in self.query_eval_model.backend.lower():
             #     prompts.enable_prompt_caching("evaluate")
 
         # the eval doc chain needs its own caching
@@ -1463,13 +1390,13 @@ class wdoc:
                 return func
 
         if " object at " in self.llm._get_llm_string():
-            red(
+            logger.warning(
                 "Found llm._get_llm_string() value that potentially "
                 f"invalidates the cache: '{self.llm._get_llm_string()}'\n"
                 f"Related github issue: 'https://github.com/langchain-ai/langchain/issues/23257'"
             )
         if " object at " in self.eval_llm._get_llm_string():
-            red(
+            logger.warning(
                 "Found eval_llm._get_llm_string() value that potentially "
                 f"invalidates the cache: '{self.eval_llm._get_llm_string()}'\n"
                 f"Related github issue: 'https://github.com/langchain-ai/langchain/issues/23257'"
@@ -1484,14 +1411,14 @@ class wdoc:
             if ratio >= 0.9:
                 if self.top_k < self.max_top_k:
                     raise ShouldIncreaseTopKAfterLLMEvalFiltering(
-                        red(
+                        logger.warning(
                             f"Number of documents found: {len(filtered_docs)}, "
                             f"top_k is {self.top_k} so ratio={ratio:.1f}, hence "
                             f"top_k should be increased. Max_top_k is {self.max_top_k}"
                         )
                     )
                 else:
-                    red(
+                    logger.warning(
                         f"Number of documents found: {len(filtered_docs)}, "
                         f"top_k is {self.top_k} so ratio={ratio:.1f}, hence "
                         f"top_k should be increased but we eached "
@@ -1508,51 +1435,72 @@ class wdoc:
             eval_model_string: str = self.eval_llm._get_llm_string(),  # just for caching
             eval_prompt: str = str(prompts.evaluate.to_json()),
         ) -> List[str]:
-            if isinstance(self.eval_llm, FakeListLLM):
-                outputs = ["1" for i in range(self.query_eval_check_number)]
+            if isinstance(self.eval_llm, FakeListChatModel):
+                outputs = ["10" for i in range(self.query_eval_check_number)]
                 new_p = 0
                 new_c = 0
+                new_r = 0
 
             elif "n" in self.eval_llm_params or self.query_eval_check_number == 1:
+
+                def _parse_outputs(out) -> List[str]:
+                    reasons = [
+                        gen.generation_info["finish_reason"] for gen in out.generations
+                    ]
+                    outputs = [gen.text for gen in out.generations]
+                    # don't always crash if finish_reason is not stop, because it can sometimes still be parsed.
+                    if not all(r == "stop" for r in reasons):
+                        logger.warning(
+                            f"Unexpected generation finish_reason: '{reasons}' for generations: '{outputs}'. Expected 'stop'"
+                        )
+                    assert outputs, "No generations found by query eval llm"
+                    # parse_eval_output will crash if the output is bad anyway
+                    outputs = [parse_eval_output(o) for o in outputs]
+                    return outputs
+
                 try:
                     out = self.eval_llm._generate_with_cache(
-                        prompts.evaluate.format_messages(**inputs)
+                        prompts.evaluate.format_messages(**inputs),
+                        request_timeout=env.WDOC_LLM_REQUEST_TIMEOUT,
                     )
+                    outputs = _parse_outputs(out)
                 except Exception:  # retry without cache
+                    logger.debug(
+                        f"Failed to run eval_llm on an input. Retrying without cache."
+                    )
                     out = self.eval_llm._generate(
-                        prompts.evaluate.format_messages(**inputs)
+                        prompts.evaluate.format_messages(**inputs),
+                        request_timeout=env.WDOC_LLM_REQUEST_TIMEOUT,
                     )
-                reasons = [
-                    gen.generation_info["finish_reason"] for gen in out.generations
-                ]
-                outputs = [gen.text for gen in out.generations]
-                # don't crash if finish_reason is not stop, because it can sometimes still be parsed.
-                if not all(r in ["stop", "length"] for r in reasons):
-                    red(
-                        f"Unexpected generation finish_reason: '{reasons}' for generations: '{outputs}'"
-                    )
-                assert outputs, "No generations found by query eval llm"
-                outputs = [parse_eval_output(o) for o in outputs]
+                    outputs = _parse_outputs(out)
+
                 if out.llm_output:
                     new_p = out.llm_output["token_usage"]["prompt_tokens"]
                     new_c = out.llm_output["token_usage"]["completion_tokens"]
+                    new_r = (
+                        out.llm_output["token_usage"]["total_tokens"] - new_p - new_c
+                    )
                 else:
                     new_p = 0
                     new_c = 0
+                    new_r = 0
 
             else:
                 outputs = []
                 new_p = 0
                 new_c = 0
+                new_r = 0
 
                 async def do_eval(subinputs):
                     try:
                         val = await self.eval_llm._agenerate_with_cache(
-                            prompts.evaluate.format_messages(**subinputs)
+                            prompts.evaluate.format_messages(**subinputs),
+                            request_timeout=env.WDOC_LLM_REQUEST_TIMEOUT,
                         )
-                    except Exception:  # retrywithout cache
+                    except Exception:  # retry without cache
                         val = await self.eval_llm._agenerate(
-                            prompts.evaluate.format_messages(**subinputs)
+                            prompts.evaluate.format_messages(**subinputs),
+                            request_timeout=env.WDOC_LLM_REQUEST_TIMEOUT,
                         )
                     return val
 
@@ -1570,31 +1518,46 @@ class wdoc:
                     outputs.append(out.generations[0].text)
                     finish_reason = out.generations[0].generation_info["finish_reason"]
                     if finish_reason not in ["stop", "length"]:
-                        red(
+                        logger.warning(
                             f"Unexpected finish_reason: '{finish_reason}' for generation '{outputs[-1]}'"
                         )
                     if out.llm_output:
                         new_p += out.llm_output["token_usage"]["prompt_tokens"]
                         new_c += out.llm_output["token_usage"]["completion_tokens"]
+                        new_r += (
+                            out.llm_output["token_usage"]["total_tokens"]
+                            - new_p
+                            - new_c
+                        )
                 assert outputs, "No generations found by query eval llm"
                 outputs = [parse_eval_output(o) for o in outputs]
 
+            if len(outputs) < self.query_eval_check_number and len(outputs) == 1:
+                logger.warning(
+                    f"query eval model produced 1 output instead of {self.query_eval_check_number}). Output: '{outputs}'\nThis is usually because the model is wrongly specified by litellm as having a modifiable `n` parameter. To avoid this use another model or set the query_eval_check_number to 1."
+                )
+                if "n" in self.eval_llm_params:
+                    self.eval_llm_params.remove("n")
+                outputs = outputs * self.query_eval_check_number
             assert (
                 len(outputs) == self.query_eval_check_number
-            ), f"query eval model failed to produce {self.query_eval_check_number} outputs: '{outputs}'"
+            ), f"Query eval model produced an unexpected number of outputs ({outputs} but expected {self.query_eval_check_number} outputs).\nInputs: {inputs}'"
 
             self.eval_llm.callbacks[0].prompt_tokens += new_p
             self.eval_llm.callbacks[0].completion_tokens += new_c
-            self.eval_llm.callbacks[0].total_tokens += new_p + new_c
+            self.eval_llm.callbacks[0].internal_reasoning_tokens += new_r
+            self.eval_llm.callbacks[0].total_tokens += new_p + new_c + new_r
             if self.eval_llm.callbacks[0].pbar:
                 self.eval_llm.callbacks[0].pbar[-1].update(1)
             return outputs
 
         # uses in most places to increase concurrency limit
-        multi = {"max_concurrency": WDOC_LLM_MAX_CONCURRENCY if not self.debug else 1}
+        multi = {
+            "max_concurrency": env.WDOC_LLM_MAX_CONCURRENCY if not self.debug else 1
+        }
 
         if self.task == "search":
-            if self.query_eval_modelname:
+            if self.query_eval_model is not None:
                 # for some reason I needed to have at least one chain object otherwise rag_chain is a dict
                 @chain
                 @optional_typecheck
@@ -1634,6 +1597,8 @@ class wdoc:
                     "unfiltered_docs": itemgetter("unfiltered_docs"),
                     "question_to_answer": itemgetter("question_to_answer"),
                 }
+
+                logger.debug("Defining the rag_chain")
                 rag_chain = (
                     retrieve_documents
                     | sieve_documents(instance=self)
@@ -1653,6 +1618,7 @@ class wdoc:
                     try:
                         assert self.top_k not in tried_top_k
                         tried_top_k.append(self.top_k)
+                        logger.debug("Calling the rag_chain")
                         output = rag_chain.invoke(
                             {
                                 "question_for_embedding": query_fe,
@@ -1679,44 +1645,50 @@ class wdoc:
             else:
                 docs = retriever.invoke(query)
                 if len(docs) < self.interaction_settings["top_k"]:
-                    red(f"Only found {len(docs)} relevant documents")
+                    logger.warning(f"Only found {len(docs)} relevant documents")
 
-            if self.import_mode:
-                if "unfiltered_docs" in output:
-                    red(
-                        f"Number of documents using embeddings: {len(output['unfiltered_docs'])}"
-                    )
-                if "filtered_docs" in output:
-                    red(
-                        f"Number of documents found relevant by eval LLM: {len(output['filtered_docs'])}"
-                    )
-                if "relevant_filtered_docs" in output:
-                    red(
-                        f"Number of documents found relevant by answer LLM: {len(output['relevant_filtered_docs'])}"
-                    )
-
-                evalllmcallback = self.eval_llm.callbacks[0]
-                etotal_cost = (
-                    self.query_evalllm_price[0] * evalllmcallback.prompt_tokens
-                    + self.query_evalllm_price[1] * evalllmcallback.completion_tokens
+            if "unfiltered_docs" in output:
+                logger.info(
+                    f"Number of documents using embeddings: {len(output['unfiltered_docs'])}"
                 )
-                yel(
-                    f"Tokens used by query_eval model: '{evalllmcallback.total_tokens}' (${etotal_cost:.5f})"
+            if "filtered_docs" in output:
+                logger.info(
+                    f"Number of documents found relevant by eval LLM: {len(output['filtered_docs'])}"
+                )
+            if "relevant_filtered_docs" in output:
+                logger.info(
+                    f"Number of documents found relevant by answer LLM: {len(output['relevant_filtered_docs'])}"
                 )
 
-                llmcallback = self.llm.callbacks[0]
-                total_cost = (
-                    self.llm_price[0] * llmcallback.prompt_tokens
-                    + self.llm_price[1] * llmcallback.completion_tokens
-                )
-                yel(
-                    f"Total tokens used by strong model: '{llmcallback.total_tokens}' (${total_cost:.5f})"
-                )
-                red(f"Total cost: ${total_cost + etotal_cost:.5f}")
+            evalllmcallback = self.eval_llm.callbacks[0]
+            etotal_cost = (
+                self.query_evalllm_price["prompt"] * evalllmcallback.prompt_tokens
+                + self.query_evalllm_price["completion"]
+                * evalllmcallback.completion_tokens
+                + self.query_evalllm_price["internal_reasoning"]
+                * evalllmcallback.internal_reasoning_tokens
+            )
+            logger.debug(
+                f"Tokens used by query_eval model: '{evalllmcallback.total_tokens}' (${etotal_cost:.5f})"
+            )
+
+            llmcallback = self.llm.callbacks[0]
+            total_cost = (
+                self.llm_price["prompt"] * llmcallback.prompt_tokens
+                + self.llm_price["completion"] * llmcallback.completion_tokens
+                + self.llm_price["internal_reasoning"]
+                * llmcallback.internal_reasoning_tokens
+            )
+            logger.debug(
+                f"Total tokens used by strong model: '{llmcallback.total_tokens}' (${total_cost:.5f})"
+            )
+            logger.warning(f"Total cost: ${total_cost + etotal_cost:.5f}")
+
+            if self.__import_mode__:
                 return output
 
             md_printer("\n\n# Documents")
-            if WDOC_OPEN_ANKI:
+            if env.WDOC_OPEN_ANKI:
                 anki_nids = []
                 to_print = ""
             for id, doc in enumerate(docs):
@@ -1726,33 +1698,39 @@ class wdoc:
                 for k, v in doc.metadata.items():
                     to_print += f"* **{k}**: `{v}`\n"
                 to_print += "\n"
-                if WDOC_OPEN_ANKI and "anki_nid" in doc.metadata:
+                if env.WDOC_OPEN_ANKI and "anki_nid" in doc.metadata:
                     nid_str = str(doc.metadata["anki_nid"]).split(" ")
                     for nid in nid_str:
                         if nid not in anki_nids:
                             anki_nids.append(nid)
             md_printer(to_print)
-            if self.query_eval_modelname:
-                red(
+            if self.query_eval_model is not None:
+                logger.warning(
                     f"Number of documents using embeddings: {len(output['unfiltered_docs'])}"
                 )
-                red(
+                logger.warning(
                     f"Number of documents after query eval filter: {len(output['filtered_docs'])}"
                 )
 
-            if WDOC_OPEN_ANKI and anki_nids:
+            if env.WDOC_OPEN_ANKI and anki_nids:
                 open_answ = input(
                     f"\nAnki notes found, open in anki? (yes/no/debug)\n(nids: {anki_nids})\n> "
                 )
                 if open_answ == "debug":
                     breakpoint()
                 elif open_answ in ["y", "yes"]:
-                    whi("Opening anki.")
+                    logger.info("Opening anki.")
                     query = f"nid:{','.join(anki_nids)}"
-                    ankiconnect(
-                        action="guiBrowse",
-                        query=query,
-                    )
+                    try:
+                        from py_ankiconnect import PyAnkiconnect
+
+                        ankiconnect = PyAnkiconnect()
+                        ankiconnect(
+                            action="guiBrowse",
+                            query=query,
+                        )
+                    except Exception as e:
+                        logger.warning(f"Error when trying to open Anki: '{e}'")
             all_filepaths = []
             for doc in docs:
                 if "path" in doc.metadata:
@@ -1768,14 +1746,17 @@ class wdoc:
 
             evalllmcallback = self.eval_llm.callbacks[0]
             etotal_cost = (
-                self.query_evalllm_price[0] * evalllmcallback.prompt_tokens
-                + self.query_evalllm_price[1] * evalllmcallback.completion_tokens
+                self.query_evalllm_price["prompt"] * evalllmcallback.prompt_tokens
+                + self.query_evalllm_price["completion"]
+                * evalllmcallback.completion_tokens
+                + self.query_evalllm_price["internal_reasoning"]
+                * evalllmcallback.internal_reasoning_tokens
             )
-            yel(
+            logger.debug(
                 f"Tokens used by query_eval model: '{evalllmcallback.total_tokens}' (${etotal_cost:.5f})"
             )
 
-            red(f"Total cost: ${etotal_cost:.5f}")
+            logger.warning(f"Total cost: ${etotal_cost:.5f}")
             self.latest_cost = etotal_cost
 
         else:
@@ -1819,7 +1800,9 @@ class wdoc:
                 "question_to_answer": itemgetter("question_to_answer"),
             }
             answer_each_doc_chain = (
-                prompts.answer | self.llm.bind(max_tokens=1000) | StrOutputParser()
+                prompts.answer
+                | self.llm.bind(max_tokens=env.WDOC_INTERMEDIATE_ANSWER_MAX_TOKENS)
+                | StrOutputParser()
             )
 
             answer_all_docs = RunnablePassthrough.assign(
@@ -1838,6 +1821,7 @@ class wdoc:
                 "unfiltered_docs": itemgetter("unfiltered_docs"),
             }
 
+            logger.debug("Defining the rag_chain")
             rag_chain = (
                 retrieve_documents
                 | sieve_documents(instance=self)
@@ -1859,7 +1843,7 @@ class wdoc:
                 | pbar_closer(llm=self.llm)
             )
 
-            if is_verbose:
+            if env.WDOC_VERBOSE:
                 rag_chain.get_graph().print_ascii()
 
             chain_time = 0
@@ -1871,6 +1855,7 @@ class wdoc:
                 try:
                     assert self.top_k not in tried_top_k
                     tried_top_k.append(self.top_k)
+                    logger.debug("Calling the rag_chain")
                     output = rag_chain.invoke(
                         {
                             "question_for_embedding": query_fe,
@@ -1891,29 +1876,65 @@ class wdoc:
                     self.top_k = new_top_k
                 except NoDocumentsRetrieved:
                     return {
-                        "error": md_printer(
-                            f"## No documents were retrieved with query '{query_fe}'",
-                            color="red",
+                        "error": logger.error(
+                            md_printer(
+                                f"## No documents were retrieved with query '{query_fe}'",
+                                color="red",
+                            )
                         )
                     }
                 except NoDocumentsAfterLLMEvalFiltering:
                     return {
-                        "error": md_printer(
-                            f"## No documents remained after query eval LLM filtering using question '{query_an}'",
-                            color="red",
+                        "error": logger.error(
+                            md_printer(
+                                f"## No documents remained after query eval LLM filtering using question '{query_an}'",
+                                color="red",
+                            )
                         )
                     }
             chain_time = time.time() - start_time
 
             assert len(output["intermediate_answers"]) == len(output["filtered_docs"])
 
-            if len(output["intermediate_answers"]) > 1:
+            output["relevant_filtered_docs"] = []
+            output["relevant_intermediate_answers"] = []
+            for ia, a in enumerate(output["intermediate_answers"]):
+                if check_intermediate_answer(a):
+                    output["relevant_filtered_docs"].append(output["filtered_docs"][ia])
+                    output["relevant_intermediate_answers"].append(a)
+
+            # Create consistent document identifiers using WDOC_N format
+            output["source_mapping"] = {}
+            for ifd, fd in enumerate(output["relevant_filtered_docs"]):
+                doc_id = f"WDOC_{ifd + 1}"
+                output["source_mapping"][doc_id] = ifd + 1
+                ia = output["relevant_intermediate_answers"][ifd]
+                output["relevant_intermediate_answers"][
+                    ifd
+                ] = f"<doc id=[[{doc_id}]]>\n{ia}\n</doc>"
+
+            @optional_typecheck
+            def source_replace(
+                input: str, mapping: dict = output["source_mapping"]
+            ) -> str:
+                # Make a copy of the input to avoid modifying the original string during iteration
+                result = input
+                # substitude in reverse order to avoid WDOC_2 replacing WDOC_21
+                doc_ids = list(mapping.keys())
+                for doc_id in doc_ids[::-1]:
+                    doc_num = str(mapping[doc_id])
+                    result = result.replace(doc_id, doc_num)
+                return result
+
+            all_rlvt_interim_ans = [output["relevant_intermediate_answers"]]
+
+            if len(output["relevant_intermediate_answers"]) > 1:
                 # next step is to combine the intermediate answers into a single answer
                 final_answer_chain = RunnablePassthrough.assign(
                     final_answer=RunnablePassthrough.assign(
                         question=lambda inputs: inputs["question_to_answer"],
-                        intermediate_answers=lambda inputs: collate_intermediate_answers(
-                            list_ia=inputs["intermediate_answers"],
+                        intermediate_answers=lambda inputs: collate_relevant_intermediate_answers(
+                            list_ia=inputs["relevant_intermediate_answers"],
                         ),
                     )
                     | prompts.combine
@@ -1921,69 +1942,54 @@ class wdoc:
                     | StrOutputParser()
                 )
 
-                # add the document hash as source to each intermediate answer, they will then be combined together and replaced again last minute by more legible identifiers
-                for ifd, fd in enumerate(output["filtered_docs"]):
-                    ia = output["intermediate_answers"][ifd]
-                    doc_hash = fd.metadata["content_hash"][:5]
-                    output["intermediate_answers"][
-                        ifd
-                    ] = f"Source identifier: [{doc_hash}]\n{ia}"
-                source_hashes = {
-                    d.metadata["content_hash"][:5]: str(idoc + 1)
-                    for idoc, d in enumerate(output["filtered_docs"])
-                }
-
-                @optional_typecheck
-                def source_replace(input: str) -> str:
-                    for h, idoc in source_hashes.items():
-                        input = input.replace(h, idoc)
-                    return input
-
                 llmcallback = self.llm.callbacks[0]
                 cost_before_combine = (
-                    self.llm_price[0] * llmcallback.prompt_tokens
-                    + self.llm_price[1] * llmcallback.completion_tokens
+                    self.llm_price["prompt"] * llmcallback.prompt_tokens
+                    + self.llm_price["completion"] * llmcallback.completion_tokens
+                    + self.llm_price["internal_reasoning"]
+                    * llmcallback.internal_reasoning_tokens
                 )
 
                 # group the intermediate answers by batch, then do a batch reduce mapping
                 # each batch is at least 2 intermediate answers and maxes at
                 # batch_tkn_size tokens to avoid losing anything because of
                 # the context
-                all_intermediate_answers = [output["intermediate_answers"]]
                 pbar = tqdm(
                     desc="Combining answers",
                     unit="answer",
-                    total=len(output["intermediate_answers"]),
-                    # disable=not is_verbose,
+                    total=len(output["relevant_intermediate_answers"]),
+                    # disable=not env.WDOC_VERBOSE,
+                    disable=is_out_piped,
                 )
-                temp_interm_answ = output["intermediate_answers"]
-                temp_interm_answ = thinking_answer_parser(temp_interm_answ)["answer"]
+                temp_interm_answ = output["relevant_intermediate_answers"]
+                temp_interm_answ = [
+                    thinking_answer_parser(a)["answer"] for a in temp_interm_answ
+                ]
                 while True:
                     batches = [[]]
-                    # disregard IRRELEVANT answers
-                    temp_interm_answ = [
-                        ia for ia in temp_interm_answ if check_intermediate_answer(ia)
-                    ]
-                    batches = semantic_batching(temp_interm_answ, self.embeddings)
+                    batches = semantic_batching(temp_interm_answ, self.embedding_engine)
                     batch_args = [
-                        {"question_to_answer": query_an, "intermediate_answers": b}
+                        {
+                            "question_to_answer": query_an,
+                            "relevant_intermediate_answers": b,
+                        }
                         for b in batches
                     ]
                     temp_interm_answ = []
                     batch_result = final_answer_chain.batch(batch_args)
-                    n_trial = 3
+                    n_trial = 2
                     for ia, a in enumerate(batch_result):
-                        trial = 0
-                        for trial in range(n_trial):
+                        for trial in range(1, n_trial + 1):
                             try:
+                                answer_text = a["final_answer"]
                                 o = thinking_answer_parser(
-                                    a["final_answer"],
+                                    answer_text,
                                     strict=True,
                                 )["answer"]
                                 temp_interm_answ.append(o)
                                 break
                             except Exception as e:
-                                red(
+                                logger.warning(
                                     f"Error at trial {trial} when separating "
                                     "thinking from answer from LLM output.\n\n"
                                     f"The full answer is: '{a}'\n\n"
@@ -1995,10 +2001,19 @@ class wdoc:
                                 # modify the batch slightly to bypass the cache
                                 altered_batch = batch_args[ia]
                                 altered_batch["question_to_answer"] += "."
-                                altered_batch["intermediate_answers"] += "."
                                 a = final_answer_chain.batch([altered_batch])[0]
 
-                    all_intermediate_answers.append(temp_interm_answ)
+                    if len(temp_interm_answ) == 0 and trial > 0:
+                        logger.warning(
+                            f"Couldn't continue merging documents. This is likely because the intermediate answers got too large. As a cheap workaround I'll concatenate them in semantic order. The latest batch contains {len(batch_result)} intermediate answers. The number of trial was {trial}/{n_trial}."
+                        )
+                        assert batch_result, trial
+                        concat = "\n---\n".join(
+                            [b["final_answer"] for b in batch_result]
+                        )
+                        temp_interm_answ.append(concat)
+
+                    all_rlvt_interim_ans.append(temp_interm_answ)
                     pbar.n = pbar.total - len(temp_interm_answ) + 1
                     pbar.update(0)
                     if len(temp_interm_answ) == 1:
@@ -2006,47 +2021,67 @@ class wdoc:
 
                 assert pbar.n == pbar.total
                 pbar.close()
-                assert len(all_intermediate_answers[-1]) == 1
+                assert len(all_rlvt_interim_ans[-1]) == 1
 
-                final_answer = all_intermediate_answers[-1][0]
-                output["all_intermediate_answers"] = all_intermediate_answers
+                final_answer = all_rlvt_interim_ans[-1][0]
+                output["all_relevant_intermediate_answers"] = all_rlvt_interim_ans
             else:
-                final_answer = output["intermediate_answers"][0]
-                output["all_intermediate_answers"] = [final_answer]
+                final_answer = output["relevant_intermediate_answers"][0]
 
-                def source_replace(input):
-                    return input
+                # Apply source replacement to final answer
+                final_answer = f"Source identifier: [[{doc_id}]]\n{final_answer}"
+                output["all_relevant_intermediate_answers"] = [
+                    output["relevant_intermediate_answers"][0]
+                ]
 
-                all_intermediate_answers = [final_answer]
+            # check that all sources used as intermediates are mentionned in the final answer
+            collates = "\n".join(
+                ["\n".join(d) for d in output["all_relevant_intermediate_answers"]]
+            )
+            missing_mapper = []
+            for k, v in output["source_mapping"].items():
+                if k in collates and k not in final_answer:
+                    missing_mapper.append(v)
 
             # prepare the content of the output
+            final_answer = source_replace(final_answer)
             output["final_answer"] = final_answer
-            output["relevant_filtered_docs"] = []
-            output["relevant_intermediate_answers"] = []
-            for ia, a in enumerate(output["intermediate_answers"]):
-                if check_intermediate_answer(a):
-                    output["relevant_filtered_docs"].append(output["filtered_docs"][ia])
-                    output["relevant_intermediate_answers"].append(a)
+
+            # if out_file is specified then we write the summary there too.
+            if self.out_file:
+
+                def output_handler(text: str) -> None:
+                    with open(self.out_file, "a") as f:
+                        f.write(text + "\n")
+                    return md_printer(text)
+
+            else:
+                output_handler = md_printer
 
             # display sources (i.e. documents used to answer)
-            md_printer("---")
+            output_handler("---")
             if not output["relevant_intermediate_answers"]:
-                md_printer(
-                    "\n\n# No document filtered so no intermediate answers to combine.\nThe answer will be based purely on the LLM's internal knowledge.",
-                    color="red",
+                logger.error(
+                    output_handler(
+                        "\n\n# No document filtered so no intermediate answers to combine.\nThe answer will be based purely on the LLM's internal knowledge.",
+                        color="red",
+                    )
                 )
-                md_printer(
-                    "\n\n# No document filtered so no intermediate answers to combine"
+                logger.error(
+                    output_handler(
+                        "\n\n# No document filtered so no intermediate answers to combine"
+                    )
                 )
             else:
-                md_printer("\n\n# Intermediate answers for each document:")
+                output_handler("\n\n# Intermediate answers for each document:")
+            n = len(output["relevant_intermediate_answers"])
             for counter, (ia, doc) in enumerate(
                 zip(
-                    output["relevant_intermediate_answers"],
-                    output["relevant_filtered_docs"],
+                    output["relevant_intermediate_answers"][::-1],
+                    output["relevant_filtered_docs"][::-1],
                 )
             ):
-                to_print = f"## Document #{counter + 1}\n"
+                to_print = f"## Document #{n - counter}\n"
                 content = doc.page_content.strip()
                 to_print += "```\n" + content + "\n ```\n"
                 for k, v in doc.metadata.items():
@@ -2056,115 +2091,103 @@ class wdoc:
                 # ia = "### Thinking:\n" + ia["thinking"] + "\n\n" + "### Answer:\n" + ia["answer"]
                 ia = ia["answer"]
                 to_print += indent("### Intermediate answer:\n" + ia, "> ")
-                md_printer(source_replace(to_print))
+                output_handler(source_replace(to_print))
 
             # print the final answer
             fa = thinking_answer_parser(output["final_answer"])
             # fa = "### Thinking:\n" + fa["thinking"] + "\n\n" + "### Answer:\n" + fa["answer"]
             fa = fa["answer"]
-            md_printer("---")
-            md_printer(indent(f"# Answer:\n{source_replace(fa)}\n", "> "))
+            output_handler("---")
+            output_handler(indent(f"# Answer:\n{source_replace(fa)}\n", "> "))
+
+            if missing_mapper:
+                logger.warning(
+                    f"Found some source mappers in intermediate answers that are missing from the final answer. Here are the documents #: {','.join(map(str, missing_mapper))}"
+                )
 
             # print the breakdown of documents used and chain time
-            red(
+            logger.info(
                 f"Number of documents using embeddings: {len(output['unfiltered_docs'])}"
             )
-            red(
+            logger.info(
                 f"Number of documents found relevant by eval LLM: {len(output['filtered_docs'])}"
             )
-            red(
+            logger.info(
                 f"Number of documents found relevant by answer LLM: {len(output['relevant_filtered_docs'])}"
             )
-            if len(all_intermediate_answers) > 1:
-                extra = "->".join([str(len(ia)) for ia in all_intermediate_answers])
+            if len(all_rlvt_interim_ans) > 1:
+                extra = "->".join([str(len(ia)) for ia in all_rlvt_interim_ans])
                 extra = f"({extra})"
             else:
                 extra = ""
-            red(
-                f"Number of steps to combine intermediate answers: {len(all_intermediate_answers) - 1} {extra}"
+            logger.debug(
+                f"Number of steps to combine intermediate answers: {len(all_rlvt_interim_ans) - 1} {extra}"
             )
-            red(f"Time took by the chain: {chain_time:.2f}s")
+            logger.debug(f"Time took by the chain: {chain_time:.2f}s")
 
             evalllmcallback = self.eval_llm.callbacks[0]
             etotal_cost = (
-                self.query_evalllm_price[0] * evalllmcallback.prompt_tokens
-                + self.query_evalllm_price[1] * evalllmcallback.completion_tokens
+                self.query_evalllm_price["prompt"] * evalllmcallback.prompt_tokens
+                + self.query_evalllm_price["completion"]
+                * evalllmcallback.completion_tokens
+                + self.query_evalllm_price["internal_reasoning"]
+                * evalllmcallback.internal_reasoning_tokens
             )
-            yel(
+            llmcallback = self.llm.callbacks[0]
+            total_cost = (
+                self.llm_price["prompt"] * llmcallback.prompt_tokens
+                + self.llm_price["completion"] * llmcallback.completion_tokens
+                + self.llm_price["internal_reasoning"]
+                * llmcallback.internal_reasoning_tokens
+            )
+            logger.debug(
                 f"Tokens used by query_eval model: '{evalllmcallback.total_tokens}' (${etotal_cost:.5f})"
             )
 
-            llmcallback = self.llm.callbacks[0]
-            total_cost = (
-                self.llm_price[0] * llmcallback.prompt_tokens
-                + self.llm_price[1] * llmcallback.completion_tokens
-            )
-            yel(
-                f"Total tokens used by strong model: '{llmcallback.total_tokens}' (${total_cost:.5f})"
-            )
             if "cost_before_combine" in locals():
                 combine_cost = total_cost - cost_before_combine
-                yel(
+                logger.debug(
                     f"Tokens used by strong model to combine the intermediate answers: ${combine_cost:.5f}"
                 )
 
-            red(f"Total cost: ${total_cost + etotal_cost:.5f}")
+            logger.debug(
+                f"Total tokens used by strong model: '{llmcallback.total_tokens}' (${total_cost:.5f})"
+            )
 
+            logger.info(f"Total cost: ${total_cost + etotal_cost:.5f}")
+
+            assert total_cost + etotal_cost >= self.latest_cost
             self.latest_cost = total_cost + etotal_cost
+
+            output["total_cost"] = self.latest_cost
+            output["total_model_cost"] = total_cost
+            output["total_eval_model_cost"] = etotal_cost
 
             return output
 
     @staticmethod
     @optional_typecheck
+    @set_parse_file_help_md_as_docstring
     def parse_file(
         path: Optional[Union[str, Path]] = None,
         filetype: str = "auto",
-        only_text: bool = False,
+        format: str = "text",
         cli_kwargs: Optional[dict] = None,
         debug: bool = False,
         verbose: bool = False,
         **kwargs,
-    ) -> Union[List[Document], str]:
+    ) -> Union[List[Document], str, List[dict]]:
         """
-        # 'parse_file' documentation
-
-        ## Description
-
-        Simple function to load a document given at least  path arg. Used for cli
-        and convenience in python scripts.
-
-        ## Arguments
-
-        - `path`: str
-          - Same as for wdoc (can be None, for example if filetype is `anki`).
-
-        - `filetype`: str
-            - Same as for wdoc
-
-        - `only_text`: bool, default `False`
-            - only return the text instead of a List of langchain Documents
-
-        - `cli_kwargs`: dict, default `None`
-            - Dict containing keyword arguments destined to the function
-            `batch_load_doc` and not about a specific document per say.
-            e.g. "file_loader_n_jobs", etc.
-
-        - `debug`: bool, default `False`
-            - Same as for wdoc
-
-        - `verbose`: bool, default `False`
-            - Same as for wdoc
-
-        - `**kwargs`
-          - Remaning keyword arguments are assumed to be DocDict arguments,
-            the full list is at wdoc.utils.misc.filetype_arg_types
-
-        ## Return value
-        - Either the document's page_content as a string, or a list of
-        langchain Document (so with attributes `page_content` and `metadata`).
+        This docstring is dynamically updated with the content of wdoc/docs/parse_file_help.md
         """
+        assert format in [
+            "text",
+            "xml",
+            "langchain",
+            "langchain_dict",
+        ], f"Unexpected --format value: '{format}'"
         default_cli_kwargs = {
-            "llm_name": "testing/testing",
+            "llm_name": ModelName("testing/testing"),
             "task": "query",
             "backend": "loky",  # doesn't matter because n_jobs is 1 anyway
             "n_jobs": 1,
@@ -2177,17 +2200,26 @@ class wdoc:
         if cli_kwargs is not None:
             default_cli_kwargs.update(cli_kwargs)
 
+        if "task" in kwargs:
+            assert (
+                kwargs["task"] == "parse"
+            ), f"Unexpected task when parsing. Expected 'parse' but got '{kwargs['task']}'"
+            del kwargs["task"]
+        assert (
+            "task" not in kwargs
+        ), "Cannot give --task argument if we are only parsing"
+
         if kwargs:
             kwargs = DocDict(kwargs)
 
         # all loaders need a path arg except anki
         if filetype == "anki" and path:
-            red(
+            logger.warning(
                 "You supplied a --path argument even though the filetype is `anki`, we must ignore `path` in that case."
             )
         else:
             if not path:
-                red(
+                logger.warning(
                     "You did not specify a --path argument, this will probably cause issues."
                 )
             else:
@@ -2198,10 +2230,40 @@ class wdoc:
             **default_cli_kwargs,
             **kwargs,
         )
-        if not only_text:
+        if format == "text":
+            n = len(out)
+            if n > 1:
+                return (
+                    "Parsed documents:\n"
+                    + "\n".join(
+                        [
+                            f"Doc #{i + 1}/{n}\n{d.page_content}\n\n"
+                            for i, d in enumerate(out)
+                        ]
+                    ).rstrip()
+                )
+            else:
+                return f"Parsed document:\n{out[0].page_content.strip()}"
+        elif format == "xml":
+            return (
+                "<documents>\n"
+                + "\n".join(
+                    [
+                        f"<doc id={i}>\n{d.page_content}\n</doc>"
+                        for i, d in enumerate(out)
+                    ]
+                )
+                + "\n</documents>"
+            )
+        elif format == "langchain":
             return out
+        elif format == "langchain_dict":
+            return [
+                {"page_content": doc.page_content, "metadata": doc.metadata}
+                for doc in out
+            ]
         else:
-            return "\n".join([d.page_content for d in out])
+            raise ValueError(format)
 
 
 def debug_exceptions(instance: Optional[wdoc] = None) -> None:
@@ -2214,10 +2276,10 @@ def debug_exceptions(instance: Optional[wdoc] = None) -> None:
             def p(message: str) -> None:
                 "print error, in red if possible"
                 if instance:
-                    red(instance.ntfy(message))
+                    logger.warning(instance.ntfy(message))
                 else:
                     try:
-                        red(message)
+                        logger.warning(message)
                     except Exception:
                         print(message)
 
@@ -2246,6 +2308,3 @@ def debug_exceptions(instance: Optional[wdoc] = None) -> None:
 
     sys.excepthook = handle_exception
     faulthandler.enable()
-
-
-create_langfuse_callback(wdoc.VERSION)

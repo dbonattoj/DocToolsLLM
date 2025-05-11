@@ -1,4 +1,4 @@
-# --help
+# Help
 
 ### Table of contents
 - [Global arguments](#global-arguments)
@@ -71,9 +71,11 @@
             you must type or paste the string
 
         * `txt`
+            (For text present in a txt file, not to be mistaken with `text`)
             * `--path` is path to a .txt file
 
         * `text`
+            (For text input as argument, not to be mistaken with `txt`)
             * `--path` is directly the text content.
             * Optional:
                 * `--metadata`
@@ -150,14 +152,20 @@
 
 ---
 
-* `--modelname`: str, default to value of WDOC_DEFAULT_MODELNAME
+* `--model`: str, default to value of WDOC_DEFAULT_MODEL
     * Keep in mind that given that the default backend used is litellm
-    the part of modelname before the slash (/) is the backend name (also called provider).
-    If the backend is 'testing/' then it will be parsed as 'testing/testing' and
+    the part of model name before the slash (/) is the backend name (also called provider).
+    If the backend is `testing/` then it will be parsed as `testing/testing` and
     a fake LLM will be used for debugging purposes. It answers like a normal LLM
-    but costs 0 and makes no sense.
+    but costs 0 and makes no sense. Note that it will automatically set the
+    query_eval_model to `testing/testing` too.
     If the value is not part of the model list of litellm, will use
     fuzzy matching to find the best match.
+
+* `--model_kwargs`: dict, default `None`
+    * dictionary of keyword arguments to pass to the model. For example `{'temperature': 0}`.
+    Note that changing the kwargs will sometimes keep reusing the cache,
+    use `disable_llm_cache` to avoid that.
 
 ---
 
@@ -175,8 +183,8 @@
             used to check for previous values includes the name of the model
             name)
 
-* `--embed_kwargs`: dict, default `None`
-    * dictionnary of keyword arguments to pass to the embedding.
+* `--embed_model_kwargs`: dict, default `None`
+    * dictionary of keyword arguments to pass to the embedding.
 
 * `--save_embeds_as`: str, default `"{user_dir}/latest_docs_and_embeddings"`
     * only used if task is query
@@ -205,12 +213,12 @@
 * `--query`: str, default `None`
     * if str, will be directly used for the first query if task in `["query", "search", "summarize_then_query"]`
 
-* `--query_retrievers`: str, default `"default_multiquery"`
+* `--query_retrievers`: str, default `"basic_multiquery"`
     * must be a string that specifies which retriever will be used for
     queries depending on which keyword is inside this string.
 
     * Possible values (can be combined if separated by _):
-        * `default`: cosine similarity retriever
+        * `basic`: cosine similarity retriever
         * `multiquery`: retriever that uses the LLM to reformulate your
         query to get different perspectives. This uses the strong LLM
         and, as it requires complex output parsing for now it is
@@ -219,24 +227,29 @@
         * `svm`: svm
         * `parent`: parent chunk
 
-    if contains `hyde` but modelname contains `testing` then `hyde` will
-    be removed.
-
-* `--query_eval_modelname`: str, default to value of WDOC_DEFAULT_QUERY_EVAL_MODELNAME
-    * Cheaper and quicker model than modelname. Used for intermediate
+* `--query_eval_model`: str, default to value of `WDOC_DEFAULT_QUERY_EVAL_MODEL`
+    * Cheaper and quicker model than model. Used for intermediate
     steps in the RAG, not used in other tasks.
     If the value is not part of the model list of litellm, will use
     fuzzy matching to find the best match.
     None to disable.
+
+* `--query_eval_model_kwargs`: dict, default `None`
+    * dictionary of keyword arguments to pass to the query_eval_model. For example `{'temperature': 0}`.
+    Note that changing the kwargs will sometimes keep reusing the cache,
+    use `disable_llm_cache` to avoid that.
 
 * `--query_eval_check_number`: int, default `3`
     * number of pass to do with the eval llm to check if the document
     is indeed relevant to the question. The document will not
     be processed further if the mean answer from the eval llm is too low.
     For eval llm that don't support setting `n`, multiple
-    completions will be called, which costs more.
+    completions will be called, which costs more. It happens that some
+    models are incorrectly reported as having a modifiable `n` parameter
+    when they actually don't. In this can instead of crashing `wdoc` will
+    notify you and replicate the received value `n` times.
 
-* `--query_relevancy`: float, default `0.0`
+* `--query_relevancy`: float, default `-0.5`
     * threshold underwhich a document cannot be considered relevant by
     embeddings alone. Keep in mind that the score is a similarity, so
     it goes from -1 (most different) to +1 (most similar), althrough
@@ -268,7 +281,7 @@
     * if True, will print the intermediate reasonning steps of LLMs
     if debug is set, llm_verbosity is also set to True
 
-* `--debug`: bool, default `False`
+* `--debug`: bool, default `False` or `WDOC_DEBUG` if set
     * if True will enable langchain tracing, increase verbosity,
     disable multithreading for summaries and loading files,
     display warning if an error is encountered when loading a file,
@@ -282,7 +295,7 @@
     If you just want to open the debugger in case of issue, see
     below at `WDOC_DEBUGGER`.
 
-* `--verbose`: bool, default `False`
+* `--verbose`: bool, default `False` or `WDOC_VERBOSE` if set
     Increase verbosity. Implied if `--debug` is set.
 
 * `--dollar_limit`: int, default `5`
@@ -291,7 +304,9 @@
     openai tokenizer, which is not universal.
     This only applies to the summary and to the embeddings, not
     to queries.
-    This check is skipped if the api_base url are changed.
+    This check is skipped if the api_base url are changed using `llms_api_bases`.
+    Note that the cost is assumed to be `0` for embeddings if we don't find
+    the price using litellm.
 
 * `--notification_callback`: Callable, default `None`
     * a function that must take as input a string and return the same
@@ -300,14 +315,7 @@
     using ntfy.sh to get summaries.
 
 * `--disable_llm_cache`: bool, default `False`
-    * WARNING: The cache is temporarily ignored in non openaillms
-    generations because of an error with langchain's ChatLiteLLM.
-    Basically if you don't use `--private` and use llm form openai,
-    wdoc will use ChatOpenAI with regular caching, otherwise
-    we use ChatLiteLLM with LLM caching disabled.
-    More at https://github.com/langchain-ai/langchain/issues/22389
-
-    disable caching for LLM. All caches are stored in the usual
+    * disables caching for LLM. All caches are stored in the usual
     cache folder for your system. This does not disable caching
     for documents.
 
@@ -332,35 +340,22 @@
     check that no api keys are used, check that embedding models are
     local only. It will also use a separate cache from non private.
     Note that in the current implementation, this disables any
-    callbacks to langfuse.
+    callbacks to langfuse. If you only want to override some API endpoints,
+    take a look at the argument `--llms_api_bases`.
+    Note that the values of `llms_api_bases` are whitelisted when using `private`.
 
 * `--llms_api_bases`: dict, default `None`
-    * a dict with keys in `["model", "query_eval_model"]`
+    * a dict with keys in `["model", "query_eval_model", "embeddings"]`
     The corresponding value will be used to change the url of the
     endpoint. This is needed to use local LLMs for example using
-    ollama, lmstudio etc.
-
-* `--DIY_rolling_window_embedding`: bool, default `False`
-    * enables using a DIY rolling window embedding instead of using
-    the default langchain SentenceTransformerEmbedding implementation
-
-* `--import_mode`: bool, default `False`
-    * if True, will return the answer from query instead of printing it.
-    The idea is to use if when you import wdoc instead of running
-    it from the cli. See `--silent`
-
-* `--disable_md_printing`: bool, default `True`
-    * if True, instead of using rich to display some information, default to simpler colored prints.
+    ollama, lmstudio, etc. If you want to be sure not to leak any
+    information to a remote server, you can use `---private`.
+    Note that the values of `llms_api_bases` are whitelisted when using `private`.
 
 * `--oneoff`: bool, default `False`
     * If True, will not ask for a prompt but quit right away. This
     is useful for example if you run several cli calls in parallel and
     don't want them to take all the RAM after they're done.
-
-* `--silent`: bool, default False
-    * disable almost all prints while still writing to the log.
-    Can be handy if `--import_mode` is used but beware that this can
-    remove important information.
 
 * `--version`: bool, default False
     * display the version and exit
@@ -520,9 +515,11 @@
 # Other specific arguments
 
 * `--out_file`: str or Path, default `None`
-    * If wdoc must create a summary, if out_file given the summary will
+    * For summaries: If wdoc must create a summary, if out_file given the summary will
     be written to this file. Note that the file is not erased and
     wdoc will simply append to it.
+    * For queries: If provided, the final answer and intermediate answers will be 
+    appended to this file in addition to being displayed in the terminal.
     * If `--summary_n_recursion` is used, additional files will be
     created with the name `{out_file}.n.md` with n being the n-1th recursive
     summary.
@@ -569,10 +566,10 @@
     each document instead of the metadata.
     Syntax: `[+-]your_regex`
     Example:
-    * Keep only the document that contain `winstondoc`
-        `--filter_content=+.*winstondoc.*`
-    * Discard the document that contain `winstondoc`
-        `--filter_content=-.*winstondoc.*`
+    * Keep only the document that contain `wdoc`
+        `--filter_content=+.*wdoc.*`
+    * Discard the document that contain `wdoc`
+        `--filter_content=-.*wdoc.*`
 
 * `--embed_instruct`: bool, default `None`
     * when loading an embedding model using the HuggingFace backend,
@@ -625,9 +622,17 @@
 
 # Runtime flags
 
+* `WDOC_DEBUG`
+    * Setting to `true` has the same effects as using `--debug=True`.
+
+* `WDOC_VERBOSE`
+    * Setting to `true` has the same effects as using `--verbose=True`.
+    Always set to `true` if `WDOC_DEBUG` is set to `true`.
+
 * `WDOC_TYPECHECKING`
-    * Setting for runtime type checking. Default value is `warn`.     * Possible values:
-    The typing is checked using [beartype](https://beartype.readthedocs.io/en/latest/) so shouldn't slow down the runtime.
+    * Setting for runtime type checking. Default value is `warn`. The typing is checked
+    using [beartype](https://beartype.readthedocs.io/en/latest/) so shouldn't slow down the runtime.
+    * Possible values:
         * `disabled`: disable typechecking.
         * `warn`: print a red warning if a typechecking fails.
         * `crash`: crash if a typechecking fails in any function.
@@ -688,42 +693,86 @@
 * `WDOC_PRIVATE_MODE`
     * You should never set it yourself. It is set automatically if the `--private` argument is used, and used throughout to triple check that it's indeed fully private.
 
-* `WDOC_IMPORT_TYPE`, default `lazy`
-    * If `native` will just import the packages needed by wdoc without any tricks.
+* `WDOC_IMPORT_TYPE`, default `native`
+    * If `native` will just import the packages needed by wdoc without any tricks. This is the default as it's bug-free but can be a bit slower to start up.
     * If `thread`, will try to use a separate thread to import packages making the startup time potentially smaller.
     * If `lazy`, will use lazy loading on some packages, making the startup time potentially smaller.
     * If `both`, will try to use both.
-    All other then `native` are experimental as they rely on weird python tricks.
+    All other than `native` are experimental as they rely on weird python tricks that may cause issues.
 
 * `WDOC_MOD_FAISS_SCORE_FN`
     * If True, modify on the fly the FAISS vectorstores to change their scoring function. This was  inspired by [this langchain issue where users claim the default scoring function is wrong](https://github.com/langchain-ai/langchain/issues/17333)
     Default is False.
 
-* `WDOC_LLM_MAX_CONCURRENCY`
+* `WDOC_LLM_MAX_CONCURRENCY`, default `1`
     * Set the max_concurrency limit to give langchain. If debug is used, it is overriden and set to 1.
-    Must be an int. By default is 15.
+    Must be an int.
 
-* `WDOC_MAX_CHUNK_SIZE`
+* `WDOC_LLM_REQUEST_TIMEOUT`, default `600`
+    * Sets the timeout in seconds for requests made to the LLM. This helps prevent indefinite hangs if the LLM provider is unresponsive. For example with ollama.
+
+* `WDOC_MAX_CHUNK_SIZE`, default `32_000`
     * When splitting large text into chunks, `wdoc` infers the maximum context size from litellm's models metadata.
     The maximum chunk size is capped by this value, as the maximum advertised context length is usually optimistic
     and is often at the cost of prompt adherence.
     Note that the chunk size inferred for query is not the same as for summary as we need  a much better prompt adherence
     for the latter.
     This can also be used to avoid chunking when querying a text if you want the LLM to have the entier text as context instead of chunking.
-    Default is `32_000`.
 
-* `WDOC_SEMANTIC_BATCH_MAX_TOKEN_SIZE`
+* `WDOC_SEMANTIC_BATCH_MAX_TOKEN_SIZE`, default: `2000`
     * GPT-3.5 token size considered maximum for a batch when doing semantic batching.
     Each batch contains at least two intermediate answers so it's not an absolute limitation but increasing it should
     reduce the cost of the "combine intermediate answers" step when querying.
-    Default is `1000`.
 
-* `WDOC_DEFAULT_MODELNAME`, default: `"openai/gpt-4o"`
+* `WDOC_DEFAULT_MODEL`, default: `"openai/gpt-4o"`
     * Default strong LLM to use. This is the strongest model, it will be used to answer the query about each document,
     combine those answers. It can also be used by some retrievers etc.
 
-* `WDOC_DEFAULT_QUERY_EVAL_MODELNAME`, default: `"openai/gpt-4o-mini"`
+* `WDOC_DEFAULT_QUERY_EVAL_MODEL`, default: `"openai/gpt-4o-mini"`
     * Default small LLM to use. It will be used to evaluate wether each document is relevant to the query or not.
 
 * `WDOC_DEFAULT_EMBED_MODEL`, default: `"openai/text-embedding-3-small"`
     * Default model to use for embeddings.
+
+* `WDOC_DEFAULT_EMBED_DIMENSION`, default: `none`
+    * Default number of dimension to ask from the embeddings provider.
+
+* `WDOC_EMBED_TESTING`, default: `True`
+    * If False, will skip the test of the embeddings model on simple sentences to find out if we loaded everything correctly.
+
+* `WDOC_DISABLE_EMBEDDINGS_CACHE`, default: `False`
+    * If True, bypasses the caching mechanism for embeddings and uses the embeddings model directly. This can be useful for debugging or when you want to ensure fresh embeddings are generated for each document.
+    * Note that disabling the cache only affects new queries, new documents, or during semantic batching. It will NOT affect embeddings that are loaded via `load_embeds_from`, as those embeddings are already pre-computed and stored.
+
+* `WDOC_LANGFUSE_PUBLIC_KEY`, default: `None`
+    * If present, will replace the env variable `LANGFUSE_PUBLIC_KEY`.
+
+* `WDOC_LANGFUSE_SECRET_KEY`, default: `None`
+    * If present, will replace the env variable `LANGFUSE_SECRET_KEY`.
+
+* `WDOC_LANGFUSE_HOST`, default: `None`
+    * If present, will replace the env variable `LANGFUSE_HOST`.
+
+* `WDOC_LITELLM_TAGS`, default: `None`
+    * If a comma separated list of string: they will be put as `tags` in the litellm LLM request via the ChatLiteLLM object.
+
+* `WDOC_LITELLM_USER`, default: `wdoc_llm`
+    * Put as `user` argument when creating ChatLiteLLM object that talks to LLMs.
+
+* `WDOC_CONTINUE_ON_INVALID_EVAL`, default: `True`
+    * If True, instead of raising an `InvalidDocEvaluationByLLMEval` exception when an eval LLM returns output that can't be parsed,
+    the system will print the error message in red and return "5" as the evaluation score. This allows the process to continue
+    despite evaluation parsing failures.
+    * If False, the system will raise the exception as normal, which typically causes the process to terminate.
+
+* `WDOC_INTERMEDIATE_ANSWER_MAX_TOKENS`, default: `4000`
+    * Sets the maximum number of tokens allowed for each intermediate answer when querying documents. 
+    This controls how much content the LLM generates for each document before these answers are combined 
+    into the final response. Lower values may reduce costs but might lose important details, 
+    while higher values allow for more comprehensive individual document analysis.
+
+* `WDOC_APPLY_ASYNCIO_PATCH`, default: `False`
+    * If True, applies the `nest_asyncio` patch to fix the `Event loop closed` error that can occur with Ollama and
+    other async-based LLM providers. Set to False if you're experiencing issues with asyncio or if you're
+    handling asyncio patching elsewhere in your application.
+    See https://github.com/BerriAI/litellm/pull/7625/files

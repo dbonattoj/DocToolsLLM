@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>wdoc RAG Query Algorithm Flow</title>
+    <style>
+        body {
+            font-family: system-ui, -apple-system, sans-serif;
+            margin: 0;
+            padding: 20px;
+            max-width: 800px;
+            margin: 0 auto;
+        }
+        h1 {
+            text-align: center;
+            color: #333;
+            font-size: 24px;
+            margin-bottom: 30px;
+        }
+        .flow-container {
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+            margin-bottom: 30px;
+        }
+        .step {
+            display: flex;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            overflow: hidden;
+        }
+        .step-number {
+            background-color: #5b8de8;
+            color: white;
+            font-weight: bold;
+            padding: 15px;
+            min-width: 30px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .step-content {
+            flex: 1;
+            padding: 15px;
+            background-color: #f5f8ff;
+        }
+        .step-title {
+            font-weight: 600;
+            margin-bottom: 8px;
+            color: #3366cc;
+        }
+        .step-description {
+            margin: 0;
+            color: #333;
+            line-height: 1.5;
+        }
+        .flow-arrow {
+            text-align: center;
+            color: #888;
+            font-size: 20px;
+            height: 15px;
+            line-height: 1;
+        }
+        @media print {
+            body {
+                color: #000;
+            }
+            .step {
+                break-inside: avoid;
+                page-break-inside: avoid;
+            }
+        }
+    </style>
+</head>
+<body>
+    <h1>wdoc RAG Query Algorithm Flow</h1>
+    
+    <div class="flow-container">
+        <div class="step">
+            <div class="step-number">1</div>
+            <div class="step-content">
+                <div class="step-title">Embedding Creation</div>
+                <p class="step-description">Text is split into chunks and embeddings are created for each chunk</p>
+            </div>
+        </div>
+        
+        <div class="flow-arrow">↓</div>
+        
+        <div class="step">
+            <div class="step-number">2</div>
+            <div class="step-content">
+                <div class="step-title">Query Expansion</div>
+                <p class="step-description">User query is embedded and LLM generates alternative queries</p>
+            </div>
+        </div>
+        
+        <div class="flow-arrow">↓</div>
+        
+        <div class="step">
+            <div class="step-number">3</div>
+            <div class="step-content">
+                <div class="step-title">Embedding Search</div>
+                <p class="step-description">Query embeddings used to find relevant documents (top 200)</p>
+            </div>
+        </div>
+        
+        <div class="flow-arrow">↓</div>
+        
+        <div class="step">
+            <div class="step-number">4</div>
+            <div class="step-content">
+                <div class="step-title">Document Filtering</div>
+                <p class="step-description">Small LLM evaluates if each document is relevant to query</p>
+            </div>
+        </div>
+        
+        <div class="flow-arrow">↓</div>
+        
+        <div class="step">
+            <div class="step-number">5</div>
+            <div class="step-content">
+                <div class="step-title">Iterative Search</div>
+                <p class="step-description">If &gt;90% documents are relevant, search with higher top_k</p>
+            </div>
+        </div>
+        
+        <div class="flow-arrow">↓</div>
+        
+        <div class="step">
+            <div class="step-number">6</div>
+            <div class="step-content">
+                <div class="step-title">Information Extraction</div>
+                <p class="step-description">Strong LLM extracts relevant info from documents</p>
+            </div>
+        </div>
+        
+        <div class="flow-arrow">↓</div>
+        
+        <div class="step">
+            <div class="step-number">7</div>
+            <div class="step-content">
+                <div class="step-title">Semantic Batching</div>
+                <p class="step-description">Group similar answers using hierarchical clustering</p>
+            </div>
+        </div>
+        
+        <div class="flow-arrow">↓</div>
+        
+        <div class="step">
+            <div class="step-number">8</div>
+            <div class="step-content">
+                <div class="step-title">Answer Combination</div>
+                <p class="step-description">LLM combines each batch into single answer recursively</p>
+            </div>
+        </div>
+        
+        <div class="flow-arrow">↓</div>
+        
+        <div class="step">
+            <div class="step-number">9</div>
+            <div class="step-content">
+                <div class="step-title">Final Answer</div>
+                <p class="step-description">Coherent response with references to source documents</p>
+            </div>
+        </div>
+    </div>
+</body>
+</html>

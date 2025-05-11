@@ -25,19 +25,18 @@ from beartype.typing import List, Optional, Tuple, Union
 from joblib import Parallel, delayed
 from langchain.docstore.document import Document
 from tqdm import tqdm
+from loguru import logger
 
-from .env import WDOC_BEHAVIOR_EXCL_INCL_USELESS, WDOC_MAX_LOADER_TIMEOUT
-from .flags import is_debug, is_verbose
+from .env import env, is_out_piped
 from .loaders import (
     load_one_doc_wrapped,
     load_youtube_playlist,
-    loaders_temp_dir_file,
     markdownlink_regex,
     yt_link_regex,
 )
-from .logger import logger, red, whi
 from .misc import (
     DocDict,
+    ModelName,
     cache_dir,
     doc_loaders_cache,
     file_hasher,
@@ -47,10 +46,11 @@ from .misc import (
 )
 from .typechecker import optional_typecheck
 
-assert WDOC_BEHAVIOR_EXCL_INCL_USELESS in [
+assert env.WDOC_BEHAVIOR_EXCL_INCL_USELESS in [
     "warn",
     "crash",
 ], "Unexpected value of WDOC_BEHAVIOR_EXCL_INCL_USELESS"
+
 
 # rules used to attribute input to proper filetype. For example
 # any link containing youtube will be treated as a youtube link
@@ -60,7 +60,7 @@ inference_rules = {
     # will return the key
     # the order of the keys is important
     "youtube_playlist": ["youtube.*playlist"],
-    "youtube": ["youtube", "invidi", "youtu\."],
+    "youtube": ["youtube", "invidi", r"youtu\."],
     "logseq_markdown": [".*logseq.*.md"],
     "txt": [".txt$", ".md$"],
     "online_pdf": ["^http.*pdf.*"],
@@ -93,7 +93,12 @@ for k, v in inference_rules.items():
 
 @optional_typecheck
 def batch_load_doc(
-    llm_name: str, filetype: str, task: str, backend: str, n_jobs: int, **cli_kwargs
+    llm_name: ModelName,
+    filetype: str,
+    task: str,
+    backend: str,
+    n_jobs: int,
+    **cli_kwargs,
 ) -> List[Document]:
     """load the input"""
 
@@ -141,6 +146,12 @@ def batch_load_doc(
                                 import magic
 
                                 info = magic.from_file(fp).lower()
+                                # # instead of passing the file, pass only the
+                                # # headers of the file because otherwise
+                                # # it seems to have issues with some files
+                                # with open(fp, "rb") as temp:
+                                #     start = temp.read(1024)
+                                # info = magic.from_buffer(start).lower()
                             except Exception as err:
                                 raise Exception(
                                     f"Failed to run python-magic as a last resort heuristic: '{err}'"
@@ -159,7 +170,7 @@ def batch_load_doc(
                                     "No more python magic heuristics to try"
                                 )
                     except Exception as err:
-                        red(
+                        logger.warning(
                             f"Failed to detect 'auto' filetype for '{fp}' with regex and even python-magic. Error: '{err}'"
                         )
 
@@ -253,7 +264,7 @@ def batch_load_doc(
     temp = []
     for d in to_load:
         if d in temp:
-            red(f"Removed document {d} (duplicate)")
+            logger.warning(f"Removed document {d} (duplicate)")
         else:
             temp.append(d)
     to_load = temp
@@ -282,7 +293,7 @@ def batch_load_doc(
     doc_hashes = Parallel(
         n_jobs=-1 if len(to_load) > 1 else 1,
         backend=backend,
-        verbose=0 if not is_verbose else 51,
+        verbose=0 if not env.WDOC_VERBOSE else 51,
     )(
         delayed(file_hasher)(doc=doc)
         for doc in tqdm(
@@ -290,7 +301,7 @@ def batch_load_doc(
             desc="Hashing files",
             unit="doc",
             colour="magenta",
-            disable=len(to_load) <= 10_000,
+            disable=len(to_load) <= 10_000 or is_out_piped,
         )
     )
     for i, h in enumerate(doc_hashes):
@@ -328,7 +339,7 @@ def batch_load_doc(
 
     # load_functions are slow to load so loading them here in advance for every file
     if any(("load_functions" in doc and doc["load_functions"]) for doc in to_load):
-        whi("Preloading load_functions")
+        logger.info("Preloading load_functions")
         for idoc, doc in enumerate(to_load):
             if "load_functions" in doc:
                 if doc["load_functions"]:
@@ -358,9 +369,8 @@ def batch_load_doc(
             shutil.rmtree(f)
     temp_dir = cache_dir / load_temp_name
     temp_dir.mkdir(exist_ok=False)
-    loaders_temp_dir_file.write_text(str(temp_dir.absolute().resolve()))
 
-    loader_max_timeout = WDOC_MAX_LOADER_TIMEOUT
+    loader_max_timeout = env.WDOC_MAX_LOADER_TIMEOUT
     if loader_max_timeout <= 0:
         loader_max_timeout = None
 
@@ -372,8 +382,8 @@ def batch_load_doc(
         ] = "crash"  # crash if loading fails when only one document is to be loaded and fails anyway
     else:
         if backend == "loky":
-            if is_verbose:
-                red("Using loky backend so not using 'require=sharedmem'")
+            if env.WDOC_VERBOSE:
+                logger.warning("Using loky backend so not using 'require=sharedmem'")
         else:
             sharedmem = "sharedmem"
 
@@ -392,7 +402,7 @@ def batch_load_doc(
         generator_doc_lists = Parallel(
             n_jobs=n_jobs,
             backend=backend,
-            verbose=0 if not is_verbose else 51,
+            verbose=0 if not env.WDOC_VERBOSE else 51,
             timeout=loader_max_timeout,
             return_as="generator",  # try to reduce memory footprint
             require=sharedmem,
@@ -408,6 +418,7 @@ def batch_load_doc(
                 desc="Loading",
                 unit="doc",
                 colour="magenta",
+                disable=is_out_piped,
             )
         )
         doc_lists = []
@@ -430,22 +441,24 @@ def batch_load_doc(
             #                     assert isinstance(er, str), er
             #                     mess += f"\n- #{cnt}: {fd}: '{er}'"
             #             mess += f"\nLatest error was: '{o}'"
-            #             raise Exception(red(mess))
+            #             logger.warning(mess)
+            #             raise Exception(mess)
     except MultiprocessTimeoutError as e:
         raise Exception(
-            red(f"Timed out when loading batch files after {loader_max_timeout}s")
+            logger.warning(
+                f"Timed out when loading batch files after {loader_max_timeout}s"
+            )
         ) from e
 
-    # erases content that links to the loaders temporary files at startup
-    loaders_temp_dir_file.write_text("")
-
-    red(f"Done loading all {len(to_load)} documents in {time.time()-t_load:.2f}s")
+    logger.info(
+        f"Done loading all {len(to_load)} documents in {time.time()-t_load:.2f}s"
+    )
     missing_docargs = []
     for idoc, d in tqdm(
         enumerate(doc_lists),
         total=len(doc_lists),
         desc="Concatenating results",
-        disable=not is_verbose,
+        disable=not env.WDOC_VERBOSE or is_out_piped,
     ):
         if isinstance(d, list):
             docs.extend(d)
@@ -461,9 +474,9 @@ def batch_load_doc(
         missing_docargs = sorted(
             missing_docargs, key=lambda x: json.dumps(x, ensure_ascii=False)
         )
-        red(f"Number of failed documents: {len(missing_docargs)}:")
+        logger.warning(f"Number of failed documents: {len(missing_docargs)}:")
     else:
-        red("No document failed to load!")
+        logger.debug("No document failed to load!")
 
     if len(missing_docargs) == len(doc_lists):
         raise Exception("All documents failed to load. The errors appear above.")
@@ -485,21 +498,23 @@ def batch_load_doc(
             else:
                 no_st += 1
         should_crash = False
-        red("Found the following source_tag after loading all documents:")
+        logger.warning("Found the following source_tag after loading all documents:")
         for n, s in st.items():
-            red(f"- {s}: {n}")
+            logger.warning(f"- {s}: {n}")
             if n == 0:
                 should_crash = True
         if extra:
-            red("Found the following EXTRA source_tag after loading all documents:")
-            red("(This can happen after merging identical documents though)")
+            logger.warning(
+                "Found the following EXTRA source_tag after loading all documents:"
+            )
+            logger.warning("(This can happen after merging identical documents though)")
             should_crash = True
             for n, s in extra.items():
-                red(f"- {s}: {n}")
-        red(f"Found {no_st} documents with no source_tag")
+                logger.warning(f"- {s}: {n}")
+        logger.warning(f"Found {no_st} documents with no source_tag")
 
         if should_crash:
-            red(
+            logger.warning(
                 "Something might have gone wrong given those source tags.\nAnswer 'crash' to crash, 'd' to debug, anything else to continue."
             )
             ans = input(">")
@@ -513,19 +528,21 @@ def batch_load_doc(
     # smart deduplication before embedding:
     # find the document with the same content_hash, merge their metadata and keep only one
     if "summar" not in task and len(docs) > 1:
-        red("Deduplicating...")
-        whi("Getting all hash")
+        logger.debug("Deduplicating...")
+        logger.debug("Getting all hash")
         content_hash = [d.metadata["content_hash"] for d in docs]
-        whi("Counting them")
+        logger.debug("Counting them")
         counts = Counter(content_hash)
         dupes = set()
         [dupes.add(h) for h, c in counts.items() if c > 1]
         deduped = {}
         lenbefore = len(docs)
-        for idoc, doc in enumerate(tqdm(docs, desc="Deduplicating", unit="doc")):
+        for idoc, doc in enumerate(
+            tqdm(docs, desc="Deduplicating", unit="doc", disable=is_out_piped)
+        ):
             ch = doc.metadata["content_hash"]
             if not dupes:
-                whi("No duplicates!")
+                logger.debug("No duplicates!")
                 break
             if ch in deduped:
                 assert doc.page_content == deduped[ch].page_content
@@ -547,8 +564,8 @@ def batch_load_doc(
                         deduped[ch].metadata[k], list
                     ):
                         deduped[ch].metadata[k] += deduped[ch].metadata[k]
-                    elif is_verbose:
-                        red(f"UNEXPECTED METADATA TYPE: '{k}:{v}'")
+                    elif env.WDOC_VERBOSE:
+                        logger.warning(f"UNEXPECTED METADATA TYPE: '{k}:{v}'")
                 docs[idoc] = None
 
             if ch in dupes:
@@ -587,7 +604,7 @@ def parse_recursive_paths(
     exclude: Optional[List[str]] = None,
     **extra_args,
 ) -> List[Union[DocDict, dict]]:
-    whi(f"Parsing recursive load_filetype: '{path}'")
+    logger.info(f"Parsing recursive load_filetype: '{path}'")
     assert recursed_filetype not in [
         "recursive_paths",
         "json_entries",
@@ -620,10 +637,11 @@ def parse_recursive_paths(
         doclist = [d for d in doclist if any(inc.search(d) for inc in include)]
         if not len(doclist) < ndoclist:
             mess = f"Include rules were useless and didn't filter out anything.\nInclude rules: '{include}'"
-            if WDOC_BEHAVIOR_EXCL_INCL_USELESS == "warn":
-                red(mess)
-            elif WDOC_BEHAVIOR_EXCL_INCL_USELESS == "crash":
-                raise Exception(red(mess))
+            if env.WDOC_BEHAVIOR_EXCL_INCL_USELESS == "warn":
+                logger.warning(mess)
+            elif env.WDOC_BEHAVIOR_EXCL_INCL_USELESS == "crash":
+                logger.warning(mess)
+                raise Exception(mess)
 
     if exclude:
         for iexc, exc in enumerate(exclude):
@@ -637,10 +655,11 @@ def parse_recursive_paths(
             doclist = [d for d in doclist if not exc.search(d)]
             if not len(doclist) < ndoclist:
                 mess = f"Exclude rule '{exc}' was useless and didn't filter out anything.\nExclude rules: '{exclude}'"
-                if WDOC_BEHAVIOR_EXCL_INCL_USELESS == "warn":
-                    red(mess)
-                elif WDOC_BEHAVIOR_EXCL_INCL_USELESS == "crash":
-                    raise Exception(red(mess))
+                if env.WDOC_BEHAVIOR_EXCL_INCL_USELESS == "warn":
+                    logger.warning(mess)
+                elif env.WDOC_BEHAVIOR_EXCL_INCL_USELESS == "crash":
+                    logger.warning(mess)
+                    raise Exception(mess)
 
     for i, d in enumerate(doclist):
         doc_kwargs = cli_kwargs.copy()
@@ -661,7 +680,7 @@ def parse_json_entries(
     path: Union[str, Path],
     **extra_args,
 ) -> List[Union[DocDict, dict]]:
-    whi(f"Loading json_entries: '{path}'")
+    logger.info(f"Loading json_entries: '{path}'")
     doclist = str(Path(path).read_text()).splitlines()
     doclist = [p[1:].strip() if p.startswith("-") else p.strip() for p in doclist]
     doclist = [
@@ -693,7 +712,7 @@ def parse_toml_entries(
     path: Union[str, Path],
     **extra_args,
 ) -> List[Union[DocDict, dict]]:
-    whi(f"Loading toml_entries: '{path}'")
+    logger.info(f"Loading toml_entries: '{path}'")
     content = rtoml.load(toml=Path(path))
     assert isinstance(content, dict)
     doclist = list(content.values())
@@ -726,7 +745,7 @@ def parse_link_file(
     path: Union[str, Path],
     **extra_args,
 ) -> List[DocDict]:
-    whi(f"Loading link_file: '{path}'")
+    logger.info(f"Loading link_file: '{path}'")
     doclist = str(Path(path).read_text()).splitlines()
     doclist = [p[1:].strip() if p.startswith("-") else p.strip() for p in doclist]
     doclist = [
@@ -760,9 +779,9 @@ def parse_youtube_playlist(
     **extra_args,
 ) -> List[DocDict]:
     if "\\" in path:
-        red(f"Removed backslash found in '{path}'")
+        logger.warning(f"Removed backslash found in '{path}'")
         path = path.replace("\\", "")
-    whi(f"Loading youtube playlist: '{path}'")
+    logger.info(f"Loading youtube playlist: '{path}'")
     video = load_youtube_playlist(path)
 
     playlist_title = video["title"].strip().replace("\n", "")
@@ -784,6 +803,13 @@ def parse_youtube_playlist(
         doclist[i] = DocDict(doc_kwargs)
 
     assert doclist, f"No video found in youtube playlist: {path}"
+    for idoc, doc in enumerate(doclist):
+        if "playlist_title" in doc.metadata and doc.metadata["playlist_title"]:
+            if playlist_title not in doc.metadata["playlist_title"]:
+                doc.metadata["playlist_title"] += " - " + playlist_title
+        else:
+            doc.metadata["playlist_title"] = playlist_title
+        doclist[idoc]
     return doclist
 
 

@@ -4,18 +4,20 @@ Chain (logic) used to summarize a document.
 
 from pathlib import Path
 
-from beartype.typing import Any, List, Tuple, Union
+from beartype.typing import Any, List, Tuple, Dict
 from langchain.docstore.document import Document
 from tqdm import tqdm
+from loguru import logger
 
-from ..logger import red, whi
-from ..misc import thinking_answer_parser
+from ..misc import thinking_answer_parser, log_and_time_fn
 from ..prompts import BASE_SUMMARY_PROMPT, PREV_SUMMARY_TEMPLATE, RECURSION_INSTRUCTION
 from ..typechecker import optional_typecheck
+from ..env import env
 
 HOME = str(Path.home())
 
 
+@log_and_time_fn
 @optional_typecheck
 def do_summarize(
     docs: List[Document],
@@ -23,18 +25,16 @@ def do_summarize(
     language: str,
     modelbackend: str,
     llm: Any,
-    llm_price: List[float],
     verbose: bool,
     n_recursion: int = 0,
-) -> Tuple[str, int, Union[float, int], int, int]:
+) -> Tuple[str, int, Dict[str, int]]:
     "summarize each chunk of a long document"
     summaries = []
     previous_summary = ""
 
     llm.bind(verbose=verbose)
 
-    total_tokens = [0, 0]
-    total_cost = 0
+    token_details = {"prompt": 0, "completion": 0, "internal_reasoning": 0}
 
     metadata = metadata.replace(HOME, "~")  # extra privacy just in case a path appears
 
@@ -50,16 +50,22 @@ def do_summarize(
             text=rd.page_content,
         )
         if " object at " in llm._get_llm_string():
-            red(
+            logger.warning(
                 "Found llm._get_llm_string() value that potentially "
                 f"invalidates the cache: '{llm._get_llm_string()}'\n"
                 f"Related github issue: 'https://github.com/langchain-ai/langchain/issues/23257'"
             )
         try:
-            output = llm._generate_with_cache(messages)
+            output = llm._generate_with_cache(
+                messages, request_timeout=env.WDOC_LLM_REQUEST_TIMEOUT
+            )
         except Exception as e:
-            red(f"Error when generating with cache, trying without cache: '{e}'")
-            output = llm._generate(messages)
+            logger.warning(
+                f"Error when generating with cache, trying without cache: '{e}'"
+            )
+            output = llm._generate(
+                messages, request_timeout=env.WDOC_LLM_REQUEST_TIMEOUT
+            )
         if output.generations[0].generation_info is None:
             assert "fake-list-chat-model" in llm._get_llm_string()
             finish = "stop"
@@ -71,22 +77,49 @@ def do_summarize(
         if output.llm_output:  # only present if not caching
             new_p = output.llm_output["token_usage"]["prompt_tokens"]
             new_c = output.llm_output["token_usage"]["completion_tokens"]
+            new_r = output.llm_output["token_usage"]["total_tokens"] - (new_p + new_c)
+            logger.debug(
+                "LLM token usage output for that completion: "
+                + str(output.llm_output["token_usage"])
+            )
         else:
             new_p = 0
             new_c = 0
-        total_tokens[0] += new_p
-        total_tokens[1] += new_c
-        total_cost += (new_p * llm_price[0] + new_c + llm_price[1]) / 1e6
+            new_r = 0
+        token_details["prompt"] += new_p
+        token_details["completion"] += new_c
+        token_details["internal_reasoning"] += new_r
 
         # the callback need to be updated manually when _generate is called
         llm.callbacks[0].prompt_tokens += new_p
         llm.callbacks[0].completion_tokens += new_c
-        llm.callbacks[0].total_tokens += new_p + new_c
+        llm.callbacks[0].internal_reasoning_tokens += new_r
+        llm.callbacks[0].total_tokens += new_p + new_c + new_r
 
         parsed = thinking_answer_parser(out)
-        whi("Thinking: " + parsed["thinking"])
+        if verbose and parsed["thinking"]:
+            logger.info("Thinking: " + parsed["thinking"])
 
         output_lines = parsed["answer"].rstrip().splitlines(keepends=True)
+
+        # Remove first line if:
+        # - it contains "a deep breath"
+        # - it starts with "i'll summarize" (case insensitive)
+        # - it's a bullet point containing these phrases
+        if output_lines:
+            first_line = output_lines[0].lower()
+            should_remove = (
+                "a deep breath" in first_line
+                or first_line.startswith("i'll summarize")
+                or (
+                    first_line.strip().startswith("- ")
+                    and (
+                        "a deep breath" in first_line or "i'll summarize" in first_line
+                    )
+                )
+            )
+            if should_remove:
+                output_lines = output_lines[1:]
 
         for il, ll in enumerate(output_lines):
             # remove if contains no alphanumeric character
@@ -134,15 +167,16 @@ def do_summarize(
 
             output_lines[il] = ll
 
-        good_lines = [li for li in output_lines if li]
+        good_lines = [li for li in output_lines if (li and li.replace("-", "").strip())]
         output_text = "\n".join(good_lines)
 
         if verbose:
-            whi(output_text)
+            logger.info(output_text)
 
+        assert "{previous_summary}" in PREV_SUMMARY_TEMPLATE
         previous_summary = PREV_SUMMARY_TEMPLATE.replace(
             "{previous_summary}",
-            "...\n" + "\n".join(good_lines[-5:]),
+            "\n".join(good_lines[-10:]),
         )
 
         summaries.append(output_text)
@@ -158,4 +192,4 @@ def do_summarize(
     else:
         outtext = "\n".join(summaries)
 
-    return outtext.rstrip(), n, total_cost, total_tokens[0], total_tokens[1]
+    return outtext.rstrip(), n, token_details

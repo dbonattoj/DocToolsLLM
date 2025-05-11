@@ -1,3 +1,4 @@
+import shutil
 import subprocess
 import sys
 
@@ -8,6 +9,8 @@ from setuptools.command.install import install
 class PostInstallCommand(install):
     def run(self):
         install.run(self)
+
+        pip = ["uv", "pip"] if shutil.which("uv") else ["pip"]
 
         # do "python -m playwright install"
         try:
@@ -21,7 +24,9 @@ class PostInstallCommand(install):
                 [
                     sys.executable,
                     "-m",
-                    "pip",
+                ]
+                + pip
+                + [
                     "install",
                     "git+https://github.com/ytdl-patched/ytdl-patched",
                 ]
@@ -35,7 +40,9 @@ class PostInstallCommand(install):
                 [
                     sys.executable,
                     "-m",
-                    "pip",
+                ]
+                + pip
+                + [
                     "install",
                     "-U",
                     "git+https://github.com/ytdl-org/youtube-dl.git",
@@ -43,6 +50,24 @@ class PostInstallCommand(install):
             )
         except Exception as err:
             print(f"Error when pip updating youtube_dl: '{err}'")
+
+        # do "python -m pip install -U git+https://github.com/ahupp/python-magic/
+        # see https://github.com/ahupp/python-magic/issues/261
+        try:
+            subprocess.check_call(
+                [
+                    sys.executable,
+                    "-m",
+                ]
+                + pip
+                + [
+                    "install",
+                    "-U",
+                    "git+https://github.com/ahupp/python-magic/",
+                ],
+            )
+        except Exception as err:
+            print(f"Error when pip updating python-magic from git: '{err}'")
 
         # do "openparse-download"
         try:
@@ -57,6 +82,14 @@ class PostInstallCommand(install):
                 "shouldn't matter too much.\n"
                 "For more: see https://github.com/Filimoa/open-parse/"
             )
+
+        # do "import nltk ; nltk.download('punkt_tab')"
+        try:
+            import nltk
+
+            nltk.download("punkt_tab")
+        except Exception as err:
+            print(f"Error when downloading nltk punkt_tab: '{err}'")
 
 
 with open("README.md", "r") as readme:
@@ -73,7 +106,7 @@ with open("README.md", "r") as readme:
 
 setup(
     name="wdoc",
-    version="2.5.0",
+    version="3.2.1",
     description="A perfect AI powered RAG for document query and summary. Supports ~all LLM and ~all filetypes (url, pdf, epub, youtube (incl playlist), audio, anki, md, docx, pptx, oe any combination!)",
     long_description=long_description,
     long_description_content_type="text/markdown",
@@ -109,7 +142,6 @@ setup(
     entry_points={
         "console_scripts": [
             "wdoc=wdoc.__main__:cli_launcher",
-            "wdoc_parse_file=wdoc.__main__:cli_parse_file",
         ],
     },
     python_requires=">=3.11, <3.12",
@@ -122,7 +154,9 @@ setup(
         "langchain>=0.3.1",
         "langchain-community>=0.3.1",
         "langchain-openai>=0.2.1",
-        "litellm>=1.47.0",
+        "langfuse>=2.59.3",  # for observability
+        "litellm==v1.67.6",
+        "nest_asyncio>=1.6.0",  # needed to fix ollama 'event loop closed' error thanks to https://github.com/BerriAI/litellm/pull/7625/files
         "prompt-toolkit>=3.0.47",
         "tqdm>=4.66.4",
         "faiss-cpu>=1.8.0",
@@ -135,12 +169,13 @@ setup(
         "loguru >= 0.7.2",
         "grandalf >= 0.8",  # to print ascii graph
         "lazy-import >= 0.2.2",
-        "py_ankiconnect >= 1.1.0",  # DIY wrapper to tell anki to sync just in case
+        "py_ankiconnect >= 1.1.2",  # DIY wrapper to tell anki to sync just in case
         "scikit-learn >= 1.5.1",  # for semantic reordering
         "scipy >= 1.13.1",  # for semantic reordering
-        # 'python-magic >= 0.4.27',  # for detecting file type  # made optionnal as it can help infer the filetype
+        # 'python-magic >= 0.4.27',  # for detecting file type  # made optional as it can help infer the filetype, and 0.4.28 is necessary for the pipe feature.
         "uuid6",  # for time sortable timestamp
-        "PersistDict >= 0.2.1",  # by me, like a dict but an LMDB database, to fix langchain's caches
+        "PersistDict >= 0.2.14",  # by me, like a dict but an LMDB database, to fix langchain's caches
+        "nltk>=3.8.1",  # needed for punkt_tab download in post-install
         # Loaders:
         "docx2txt >= 0.8",  # word documents
         "pandoc >= 2.3",  # epub
@@ -177,6 +212,15 @@ setup(
         "pdftotext": [
             # sudo apt install build-essential libpoppler-cpp-dev pkg-config python3-dev
             "pdftotext >= 2.2.2",
+        ],
+        "dev": [
+            "black >= 25.1.0",
+            # "isort >= 6.0.0",
+            "pre-commit >= 4.1.0",
+            "pytest >= 8.3.4",
+            "pytest-xdist >= 3.6.1",
+            "build",
+            "twine",
         ],
     },
     cmdclass={
